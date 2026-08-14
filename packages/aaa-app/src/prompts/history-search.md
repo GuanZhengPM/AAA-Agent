@@ -1,0 +1,1 @@
+Search persisted AAA Agent conversations from the current workspace. Use when earlier sessions may contain relevant decisions, requirements, explanations, or prior work. Returns matching excerpts and session IDs; it does not switch sessions.

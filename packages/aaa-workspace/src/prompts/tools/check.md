@@ -1,0 +1,1 @@
+Re-run one host-approved project check by its ID. The command is fixed by the host, runs directly without a shell, and cannot use redirection, pipelines, expansion, or a caller-supplied working directory. Use this to independently reproduce tests, type checks, lint, or build results observed during primary execution.
