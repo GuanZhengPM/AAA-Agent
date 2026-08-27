@@ -1,4 +1,4 @@
-import type { HarnessRunMetrics, HarnessTax, Model, UsageMetrics } from "./types";
+import type { AgentRunDiagnostics, HarnessRunMetrics, HarnessTax, Model, UsageMetrics } from "./types";
 
 export function createEmptyUsageMetrics(): UsageMetrics {
 	return {
@@ -29,10 +29,9 @@ export function activeTokenCount(metrics: UsageMetrics): number {
 /** Apply optional catalog pricing to normalized provider usage. */
 export function calculateModelUsageCost(model: Model, usage: UsageMetrics): number {
 	if (!model.pricing) return 0;
-	const uncachedInput = Math.max(0, usage.inputTokens - usage.cacheReadTokens);
 	return (
-		(uncachedInput * model.pricing.inputPerMillion +
-			usage.outputTokens * model.pricing.outputPerMillion +
+		(usage.inputTokens * model.pricing.inputPerMillion +
+			(usage.outputTokens + usage.reasoningTokens) * model.pricing.outputPerMillion +
 			usage.cacheReadTokens * (model.pricing.cacheReadPerMillion ?? model.pricing.inputPerMillion) +
 			usage.cacheWriteTokens * (model.pricing.cacheWritePerMillion ?? model.pricing.inputPerMillion)) /
 		1_000_000
@@ -75,6 +74,12 @@ export class HarnessMetricsCollector {
 	#subagentSpawns = 0;
 	#subagentTokens = 0;
 	#verificationAttempts = 0;
+	#providerRequests = 0;
+	#providerRetries = 0;
+	#providerLatencyMs = 0;
+	#providerWaitMs = 0;
+	#toolLatencyMs = 0;
+	#contextCompactions = 0;
 
 	recordUsage(usage: UsageMetrics): void {
 		addUsageMetrics(this.#usage, usage);
@@ -88,21 +93,43 @@ export class HarnessMetricsCollector {
 		this.#firstUsefulResultAt ??= at;
 	}
 
-	recordSubagents(count: number, usage: UsageMetrics): void {
+	recordDiagnostics(diagnostics: AgentRunDiagnostics | undefined): void {
+		if (!diagnostics) return;
+		this.#providerRequests += diagnostics.providerRequests ?? 0;
+		this.#providerRetries += diagnostics.providerRetries ?? 0;
+		this.#providerLatencyMs += diagnostics.providerLatencyMs ?? 0;
+		this.#providerWaitMs += diagnostics.providerWaitMs ?? 0;
+		this.#toolLatencyMs += diagnostics.toolLatencyMs ?? 0;
+		this.#contextCompactions += diagnostics.contextCompactions ?? 0;
+	}
+
+	recordSubagents(
+		count: number,
+		usage: UsageMetrics,
+		diagnostics: readonly (AgentRunDiagnostics | undefined)[] = [],
+	): void {
 		this.#subagentSpawns += count;
 		this.#subagentTokens += activeTokenCount(usage);
 		this.recordUsage(usage);
+		for (const item of diagnostics) this.recordDiagnostics(item);
 	}
 
-	recordVerification(usage: UsageMetrics): void {
+	recordVerification(usage: UsageMetrics, diagnostics?: AgentRunDiagnostics): void {
 		this.#verificationAttempts += 1;
 		this.recordUsage(usage);
+		this.recordDiagnostics(diagnostics);
 	}
 
 	finish(success: boolean, falseCompletion: boolean, completedAt = Date.now()): HarnessRunMetrics {
 		return {
 			...this.#usage,
 			startedAt: this.startedAt,
+			providerRequests: this.#providerRequests,
+			providerRetries: this.#providerRetries,
+			providerLatencyMs: this.#providerLatencyMs,
+			providerWaitMs: this.#providerWaitMs,
+			toolLatencyMs: this.#toolLatencyMs,
+			contextCompactions: this.#contextCompactions,
 			completedAt,
 			timeToFirstActionMs: this.#firstActionAt === undefined ? undefined : this.#firstActionAt - this.startedAt,
 			timeToFirstUsefulResultMs:

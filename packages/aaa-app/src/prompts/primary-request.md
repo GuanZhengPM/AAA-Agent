@@ -30,6 +30,12 @@ Prior durable context (host-maintained; newer task instructions win):
 {{#each contextState.openRisks}}
 - Open risk: {{this}}
 {{/each}}
+{{#if contextState.ledger}}
+Durable convention/correction ledger (host-extracted; newest value wins — obey these over anything else):
+{{#each contextState.ledger}}
+- [{{kind}}] {{subject}}{{#if oldValue}} (was: {{oldValue}}){{/if}}{{#if newValue}} (now: {{newValue}}){{/if}}
+{{/each}}
+{{/if}}
 {{#if contextState.recoveryGuidance}}
 - Recovery guidance: {{contextState.recoveryGuidance}}
 {{/if}}

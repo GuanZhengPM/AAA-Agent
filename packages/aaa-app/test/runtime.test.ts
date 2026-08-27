@@ -48,6 +48,7 @@ import {
 	type Model,
 	ModelCapabilityRegistry,
 	mergeVerifiedFacts,
+	resetProviderConcurrencyGates,
 	routeTask,
 	runAgentSession,
 	type SubagentResult,
@@ -183,6 +184,8 @@ describe("independent Codex identity", () => {
 		expect(session.success).toBe(true);
 		expect(session.output).toBe("completed");
 		expect(session.usage.toolCalls).toBe(1);
+		expect(session.usage.outputTokens).toBe(2);
+		expect(session.usage.reasoningTokens).toBe(2);
 		expect(toolExecutions).toBe(1);
 		expect(requests.map(request => request.originator)).toEqual(["aaa_agent", "aaa_agent"]);
 		const firstBody = requests[0]?.body as {
@@ -194,6 +197,190 @@ describe("independent Codex identity", () => {
 		expect(events.some(event => event.type === "tool_completed" && event.success)).toBe(true);
 		const secondBody = requests[1]?.body as { input?: Array<{ type?: string; output?: string }> };
 		expect(secondBody.input?.find(item => item.type === "function_call_output")?.output).toBe("echo:hello");
+	});
+
+	it("serializes provider requests globally for rate-sensitive GLM sessions", async () => {
+		resetProviderConcurrencyGates();
+		let active = 0;
+		let peak = 0;
+		const provider: AgentTurnProvider = {
+			provider: "z-ai-test",
+			identity: "shared-account",
+			async runTurn() {
+				active += 1;
+				peak = Math.max(peak, active);
+				await Bun.sleep(25);
+				active -= 1;
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const model: Model = {
+			provider: "z-ai",
+			id: "glm-test",
+			name: "GLM Test",
+			api: "openai-chat-completions",
+			baseUrl: "http://127.0.0.1",
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			family: "glm",
+		};
+		const results = await Promise.all(
+			Array.from({ length: 3 }, (_, index) =>
+				runAgentSession({
+					model,
+					provider,
+					cwd: process.cwd(),
+					systemPrompt: "system",
+					userPrompt: `task ${index}`,
+					tools: [],
+					policy: { reasoningEffort: Effort.Low, toolBudget: 0, maxTurns: 1 },
+					signal: AbortSignal.timeout(5_000),
+				}),
+			),
+		);
+		expect(results.every(result => result.success)).toBe(true);
+		expect(peak).toBe(1);
+		expect(results.some(result => (result.diagnostics.providerWaitMs ?? 0) > 10)).toBe(true);
+		resetProviderConcurrencyGates();
+	});
+
+	it("runs independent read-only tool calls concurrently and preserves result order", async () => {
+		let turn = 0;
+		let active = 0;
+		let peak = 0;
+		const provider: AgentTurnProvider = {
+			provider: "parallel-tools-test",
+			async runTurn(options) {
+				turn += 1;
+				if (turn === 1) {
+					const toolCalls = ["a", "b"].map(id => ({
+						callId: id,
+						name: "inspect",
+						arguments: JSON.stringify({ id }),
+					}));
+					return {
+						output: toolCalls.map(call => ({
+							type: "function_call",
+							call_id: call.callId,
+							name: call.name,
+							arguments: call.arguments,
+						})),
+						text: "",
+						toolCalls,
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				const outputs = options.input
+					.filter(item => item.type === "function_call_output")
+					.map(item => String(item.output));
+				expect(outputs).toEqual(["result-a", "result-b"]);
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const started = performance.now();
+		const session = await runAgentSession({
+			model: {
+				provider: "test",
+				id: "parallel-tools",
+				name: "Parallel Tools",
+				api: "openai-chat-completions",
+				baseUrl: "http://127.0.0.1",
+				contextWindow: 8_000,
+				efforts: [Effort.Low],
+			},
+			provider,
+			cwd: process.cwd(),
+			systemPrompt: "system",
+			userPrompt: "inspect both",
+			tools: [
+				{
+					name: "inspect",
+					label: "Inspect",
+					description: "Read one independent item.",
+					parameters: z.object({ id: z.string() }),
+					sideEffect: "none",
+					async execute(_callId, raw) {
+						const id = z.object({ id: z.string() }).parse(raw).id;
+						active += 1;
+						peak = Math.max(peak, active);
+						await Bun.sleep(80);
+						active -= 1;
+						return { content: [{ type: "text", text: `result-${id}` }] };
+					},
+				},
+			],
+			policy: { reasoningEffort: Effort.Low, toolBudget: 2, maxTurns: 2 },
+			signal: AbortSignal.timeout(5_000),
+		});
+		expect(session.success).toBe(true);
+		expect(peak).toBe(2);
+		expect(performance.now() - started).toBeLessThan(145);
+	});
+
+	it("feeds a rejected host completion back into the same tool loop", async () => {
+		let turn = 0;
+		let gateCalls = 0;
+		const seenInputs: string[] = [];
+		const provider: AgentTurnProvider = {
+			provider: "gate-test",
+			async runTurn(options) {
+				turn += 1;
+				seenInputs.push(JSON.stringify(options.input));
+				if (turn === 1) return { output: [], text: "finished", toolCalls: [], usage: createEmptyUsageMetrics() };
+				if (turn === 2) {
+					const call = { callId: "repair", name: "repair", arguments: "{}" };
+					return {
+						output: [{ type: "function_call", call_id: call.callId, name: call.name, arguments: call.arguments }],
+						text: "",
+						toolCalls: [call],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				return { output: [], text: "verified finish", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		let repaired = false;
+		const session = await runAgentSession({
+			model: {
+				provider: "test",
+				id: "gate",
+				name: "Gate",
+				api: "openai-chat-completions",
+				baseUrl: "http://127.0.0.1",
+				contextWindow: 8_000,
+				efforts: [Effort.Low],
+			},
+			provider,
+			cwd: process.cwd(),
+			systemPrompt: "system",
+			userPrompt: "repair",
+			tools: [
+				{
+					name: "repair",
+					label: "Repair",
+					description: "Repair.",
+					parameters: z.object({}),
+					sideEffect: "workspace",
+					async execute() {
+						repaired = true;
+						return { content: [{ type: "text", text: "repaired" }] };
+					},
+				},
+			],
+			policy: { reasoningEffort: Effort.Low, toolBudget: 1, maxTurns: 2 },
+			beforeFinalize: async () => {
+				gateCalls += 1;
+				return repaired
+					? { accepted: true }
+					: { accepted: false, feedback: "acceptance failed: expected repaired state" };
+			},
+			signal: AbortSignal.timeout(5_000),
+		});
+		expect(session.success).toBe(true);
+		expect(turn).toBe(3);
+		expect(gateCalls).toBe(2);
+		expect(seenInputs[1]).toContain("host-completion-gate");
+		expect(session.diagnostics.turns).toBe(3);
 	});
 
 	it("continues to a final answer despite high cumulative billed usage", async () => {
@@ -389,9 +576,10 @@ describe("independent Codex identity", () => {
 		expect(events.some(event => event.type === "policy_escalated")).toBe(false);
 	});
 
-	it("keeps ordinary large evidence intact for a 258k-context model", async () => {
+	it("compacts large evidence economically while keeping exact range retrieval", async () => {
 		let turn = 0;
-		let replayedOutputLength = 0;
+		let replayedOutput = "";
+		let availableTools: string[] = [];
 		const events: AgentSessionEvent[] = [];
 		const provider: AgentTurnProvider = {
 			provider: "test",
@@ -405,9 +593,9 @@ describe("independent Codex identity", () => {
 						usage: createEmptyUsageMetrics(),
 					};
 				}
-				replayedOutputLength =
-					(options.input.find(item => item.type === "function_call_output")?.output as string | undefined)
-						?.length ?? 0;
+				replayedOutput =
+					(options.input.find(item => item.type === "function_call_output")?.output as string | undefined) ?? "";
+				availableTools = options.tools.map(tool => tool.name);
 				return {
 					output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "summary" }] }],
 					text: "summary",
@@ -445,8 +633,81 @@ describe("independent Codex identity", () => {
 			onEvent: event => events.push(event),
 		});
 		expect(session.success).toBe(true);
-		expect(replayedOutputLength).toBe(120_009);
+		expect(replayedOutput.length).toBeGreaterThan(8_000);
+		expect(replayedOutput.length).toBeLessThan(60_000);
+		expect(replayedOutput).toContain("full tool output cached");
+		expect(availableTools).toContain("tool_output_read");
 		expect(events.some(event => event.type === "context_compacted")).toBe(false);
+	});
+
+	it("retrieves exact ranges from compacted tool outputs", async () => {
+		let turn = 0;
+		let recovered = "";
+		const original = `${"a".repeat(50_000)}EXACT-NEEDLE${"b".repeat(50_000)}`;
+		const provider: AgentTurnProvider = {
+			provider: "tool-output-cache-test",
+			async runTurn(options) {
+				turn += 1;
+				if (turn === 1) {
+					const call = { callId: "large-call", name: "large", arguments: "{}" };
+					return {
+						output: [{ type: "function_call", call_id: call.callId, name: call.name, arguments: call.arguments }],
+						text: "",
+						toolCalls: [call],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (turn === 2) {
+					const compacted = String(options.input.find(item => item.type === "function_call_output")?.output ?? "");
+					expect(compacted).toContain("full tool output cached");
+					expect(options.tools.map(tool => tool.name)).toContain("tool_output_read");
+					const call = {
+						callId: "range-call",
+						name: "tool_output_read",
+						arguments: JSON.stringify({ callId: "large-call", offset: 49_990, limit: 40 }),
+					};
+					return {
+						output: [{ type: "function_call", call_id: call.callId, name: call.name, arguments: call.arguments }],
+						text: "",
+						toolCalls: [call],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				recovered = String(options.input.filter(item => item.type === "function_call_output").at(-1)?.output ?? "");
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const session = await runAgentSession({
+			model: {
+				provider: "test",
+				id: "output-cache",
+				name: "Output Cache",
+				api: "openai-chat-completions",
+				baseUrl: "http://127.0.0.1",
+				contextWindow: 8_000,
+				efforts: [Effort.Low],
+			},
+			provider,
+			cwd: process.cwd(),
+			systemPrompt: "system",
+			userPrompt: "find the exact needle",
+			tools: [
+				{
+					name: "large",
+					label: "Large",
+					description: "Large output.",
+					parameters: z.object({}),
+					sideEffect: "none",
+					async execute() {
+						return { content: [{ type: "text", text: original }] };
+					},
+				},
+			],
+			policy: { reasoningEffort: Effort.Low, toolBudget: 2, maxTurns: 3 },
+			signal: AbortSignal.timeout(5_000),
+		});
+		expect(session.success).toBe(true);
+		expect(recovered).toContain("EXACT-NEEDLE");
 	});
 
 	it("treats the tool budget as a target without blocking useful calls", async () => {
@@ -611,6 +872,62 @@ describe("independent Codex identity", () => {
 		expect(session.error).toBe("Token limit 100 exceeded by provider usage.");
 	});
 
+	it("tracks possible shell mutation even when the command exits nonzero", async () => {
+		let turn = 0;
+		const provider: AgentTurnProvider = {
+			provider: "failed-shell-mutation",
+			async runTurn() {
+				turn += 1;
+				if (turn === 1) {
+					const call = { callId: "partial-write", name: "shell", arguments: "{}" };
+					return {
+						output: [{ type: "function_call", call_id: call.callId, name: call.name, arguments: call.arguments }],
+						text: "",
+						toolCalls: [call],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const session = await runAgentSession({
+			model: {
+				provider: "test",
+				id: "partial-shell",
+				name: "Partial Shell",
+				api: "openai-chat-completions",
+				baseUrl: "http://127.0.0.1",
+				contextWindow: 8_000,
+				efforts: [Effort.Low],
+			},
+			provider,
+			cwd: process.cwd(),
+			systemPrompt: "system",
+			userPrompt: "write",
+			tools: [
+				{
+					name: "shell",
+					label: "Shell",
+					description: "Shell.",
+					parameters: z.object({}),
+					sideEffect: "unrestricted",
+					async execute() {
+						return {
+							content: [{ type: "text", text: "wrote then failed" }],
+							details: { workspaceMutationRisk: "possible" },
+							isError: true,
+						};
+					},
+				},
+			],
+			policy: { reasoningEffort: Effort.Low, toolBudget: 1, maxTurns: 2 },
+			signal: AbortSignal.timeout(5_000),
+		});
+		expect(session.success).toBe(true);
+		expect(session.workspaceMutated).toBe(true);
+		expect(session.unknownShellEffects).toBe(true);
+	});
+
 	it("identifies AAA Agent separately from the host workspace", async () => {
 		let systemPrompt = "";
 		const provider: AgentTurnProvider = {
@@ -720,9 +1037,10 @@ describe("independent Codex identity", () => {
 	it("accepts a fresh post-mutation check without a model verifier session", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-verifier-evidence-"));
 		tempDirectories.push(directory);
+		await fs.mkdir(path.join(directory, "tests"));
 		await Bun.write(
-			path.join(directory, "smoke.test.ts"),
-			'import { expect, test } from "bun:test"; test("smoke", () => expect(1).toBe(1));',
+			path.join(directory, "tests", "test_smoke.py"),
+			"import unittest\nclass Smoke(unittest.TestCase):\n    def test_smoke(self): self.assertEqual(1, 1)\n",
 		);
 		let primaryTurn = 0;
 		let verifierCalls = 0;
@@ -738,7 +1056,14 @@ describe("independent Codex identity", () => {
 					primaryTurn === 1
 						? { callId: "write-1", name: "write", arguments: '{"path":"result.txt","content":"fixed"}' }
 						: primaryTurn === 2
-							? { callId: "check-1", name: "shell", arguments: '{"command":"bun test smoke.test.ts"}' }
+							? {
+									callId: "check-1",
+									name: "shell",
+									arguments: JSON.stringify({
+										command:
+											"python3 -m unittest discover -s tests -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY",
+									}),
+								}
 							: undefined;
 				if (call) {
 					return {
@@ -791,11 +1116,13 @@ describe("independent Codex identity", () => {
 		expect(result.success).toBe(true);
 		expect(verifierCalls).toBe(0);
 		expect(result.audit?.assurance).toBe("deterministic");
-		expect(result.audit?.evidence[0]?.summary).toContain("bun test smoke.test.ts");
+		expect(result.audit?.evidence[0]?.summary).toContain(
+			"python3 -m unittest discover -s tests -v && python3 - <<'PY'",
+		);
 		expect(result.audit?.evidence[0]?.summary).toContain("exitCode=0");
 	});
 
-	it("invalidates a successful check when a later edit changes the workspace", async () => {
+	it("re-runs a stale successful check in-loop after a later edit", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-stale-check-"));
 		tempDirectories.push(directory);
 		await Bun.write(
@@ -873,9 +1200,11 @@ describe("independent Codex identity", () => {
 			capabilities: new ModelCapabilityRegistry(),
 			overlays: new AdaptiveOverlayRegistry(),
 		});
-		expect(result.success).toBe(false);
-		expect(verifierCalls).toBe(1);
-		expect(result.audit?.summary).toContain("predates the final edit");
+		// The host now refreshes the stale check before accepting completion, so
+		// no separate verifier/recovery round is spent when it still passes.
+		expect(result.success).toBe(true);
+		expect(verifierCalls).toBe(0);
+		expect(result.audit?.summary).toContain("deterministic host check");
 	});
 
 	it("shares one token ceiling across primary and verifier sessions", async () => {
@@ -950,7 +1279,10 @@ describe("independent Codex identity", () => {
 		});
 		expect(result.success).toBe(false);
 		expect(verifierOutputLimit).toBeLessThan(24_000);
-		expect(result.verification?.summary).toContain("Token limit 24000 exceeded");
+		// Policy change: verified direct tasks now have a repair round, so the
+		// shared ceiling may be tripped by the inner reservation (before turn 1)
+		// instead of by the provider-usage check — enforce either formulation.
+		expect(result.verification?.summary).toMatch(/Token limit \d+ (?:exceeded|exhausted)/);
 	});
 });
 
@@ -969,7 +1301,7 @@ describe("interactive terminal contracts", () => {
 		expect(parseInteractiveInput("/wat")).toEqual({ type: "unknown", command: "wat" });
 	});
 
-	it("retains bounded multi-turn context and clears it explicitly", () => {
+	it("owns its multi-turn messages while external model-aware digesting handles bounds", () => {
 		const history = new ConversationHistory();
 		history.addExchange("first", "answer");
 		const snapshot = history.snapshot();
@@ -979,7 +1311,9 @@ describe("interactive terminal contracts", () => {
 			{ role: "assistant", text: "answer" },
 		]);
 		for (let index = 0; index < 30; index += 1) history.addExchange(`question ${index}`, `answer ${index}`);
-		expect(history.turns).toBe(20);
+		// No hidden fixed 40-message truncation: the REPL's model-derived digest
+		// owns compaction so evicted turns are preserved and traceable.
+		expect(history.turns).toBe(31);
 		history.clear();
 		expect(history.snapshot()).toEqual([]);
 	});
@@ -1603,15 +1937,17 @@ describe("goal, subagent, and overlay control", () => {
 		).toThrow("cycle");
 	});
 
-	it("bounds subagents, respects dependencies, and rejects automatic writers", async () => {
+	it("bounds subagents, passes dependency findings, and rejects automatic writers", async () => {
 		const started: string[] = [];
-		const runner = async (task: { id: string }): Promise<SubagentResult> => {
+		let dependentPrompt = "";
+		const runner = async (task: { id: string; prompt: string }): Promise<SubagentResult> => {
 			started.push(task.id);
+			if (task.id === "c") dependentPrompt = task.prompt;
 			await Bun.sleep(5);
 			return {
 				taskId: task.id,
 				status: "succeeded",
-				findings: [],
+				findings: task.id === "a" ? [{ summary: "A uses src/a.ts:12", evidence: [], confidence: 0.9 }] : [],
 				unresolved: [],
 				usage: { ...createEmptyUsageMetrics(), inputTokens: 10 },
 			};
@@ -1633,6 +1969,7 @@ describe("goal, subagent, and overlay control", () => {
 		expect(result.spawns).toBe(3);
 		expect(result.results.map(item => item.status)).toEqual(["succeeded", "succeeded", "succeeded", "skipped"]);
 		expect(started.indexOf("c")).toBeGreaterThan(started.indexOf("a"));
+		expect(dependentPrompt).toContain("A uses src/a.ts:12");
 		expect(result.results[3]?.error).toContain("isolation");
 		expect(result.usage.inputTokens).toBe(30);
 	});
@@ -1869,6 +2206,112 @@ describe("cross-provider adaptive runtime", () => {
 		expect(authorizationHeaders).toEqual([null, null]);
 	});
 
+	it("streams OpenAI-compatible text and fragmented tool-call arguments", async () => {
+		let requestedStreaming = false;
+		const server = Bun.serve({
+			port: 0,
+			async fetch(request) {
+				const body = z.record(z.string(), z.unknown()).parse(await request.json());
+				requestedStreaming = body.stream === true;
+				const chunks = [
+					{
+						choices: [
+							{
+								delta: {
+									content: "hel",
+									tool_calls: [
+										{ index: 0, id: "call-stream", function: { name: "ec", arguments: '{"value":' } },
+									],
+								},
+							},
+						],
+					},
+					{
+						choices: [
+							{
+								delta: {
+									content: "lo",
+									tool_calls: [{ index: 0, function: { name: "ho", arguments: '"x"}' } }],
+								},
+							},
+						],
+					},
+					{ choices: [], usage: { prompt_tokens: 12, completion_tokens: 3 } },
+				];
+				return new Response(
+					`${chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join("")}data: [DONE]\n\n`,
+					{
+						headers: { "content-type": "text/event-stream" },
+					},
+				);
+			},
+		});
+		testServers.push(server);
+		const model: Model = {
+			provider: "stream-test",
+			id: "stream-model",
+			name: "Stream Model",
+			api: "openai-chat-completions",
+			baseUrl: server.url.toString().replace(/\/$/, ""),
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		const deltas: string[] = [];
+		const result = await createOpenAICompatibleProvider(model).runTurn({
+			model,
+			systemPrompt: "system",
+			input: [],
+			tools: [],
+			effort: Effort.Low,
+			sessionId: "stream-session",
+			signal: AbortSignal.timeout(5_000),
+			onTextDelta: delta => deltas.push(delta),
+		});
+		expect(requestedStreaming).toBe(true);
+		expect(deltas).toEqual(["hel", "lo"]);
+		expect(result.text).toBe("hello");
+		expect(result.toolCalls).toEqual([{ callId: "call-stream", name: "echo", arguments: '{"value":"x"}' }]);
+		expect(result.usage.inputTokens).toBe(12);
+	});
+
+	it("leaves retry ownership to the agent loop instead of multiplying transport attempts", async () => {
+		let requests = 0;
+		const server = Bun.serve({
+			port: 0,
+			fetch() {
+				requests += 1;
+				return Response.json(
+					{ error: { code: "1302", message: "rate limited" } },
+					{ status: 429, headers: { "retry-after": "0" } },
+				);
+			},
+		});
+		testServers.push(server);
+		const model: Model = {
+			provider: "retry-test",
+			id: "retry-model",
+			name: "Retry Model",
+			api: "openai-chat-completions",
+			baseUrl: server.url.toString().replace(/\/$/, ""),
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		await expect(
+			createOpenAICompatibleProvider(model).runTurn({
+				model,
+				systemPrompt: "system",
+				input: [],
+				tools: [],
+				effort: Effort.Low,
+				sessionId: "retry-session",
+				signal: AbortSignal.timeout(5_000),
+			}),
+		).rejects.toThrow("429");
+		expect(requests).toBe(1);
+	});
+
 	it("resolves provider-qualified models and preserves variant isolation", () => {
 		const models: Model[] = [
 			{
@@ -2061,6 +2504,34 @@ describe("cross-provider adaptive runtime", () => {
 		});
 		expect(body.reasoning).toEqual({ effort: "none" });
 		expect(body.service_tier).toBe("priority");
+		expect(body.prompt_cache_key).toBe("session");
+	});
+
+	it("keeps output caps local for Codex while forwarding them to standard Responses", () => {
+		const base: Model = {
+			provider: "responses-test",
+			id: "gpt-test",
+			name: "Responses Test",
+			api: "openai-responses",
+			baseUrl: "https://api.openai.com/v1",
+			contextWindow: 8_000,
+			maxOutputTokens: 4_000,
+			efforts: [Effort.Medium],
+			authChannel: "local",
+		};
+		const request = (model: Model) =>
+			createResponsesRequestBody({
+				model,
+				systemPrompt: "system",
+				input: [{ type: "message", role: "user", content: [{ type: "input_text", text: "hello" }] }],
+				tools: [],
+				effort: Effort.Medium,
+				maxOutputTokens: 3_000,
+				sessionId: "session",
+				signal: AbortSignal.timeout(5_000),
+			});
+		expect(request(base).max_output_tokens).toBe(3_000);
+		expect(request({ ...base, provider: "openai-codex", api: "codex-responses" }).max_output_tokens).toBeUndefined();
 	});
 
 	it("runs a Claude Messages tool loop and preserves thinking blocks", async () => {
@@ -2139,7 +2610,8 @@ describe("cross-provider adaptive runtime", () => {
 			expect(paths).toEqual(["/v1/messages", "/v1/messages"]);
 			expect(apiKeys).toEqual(["secret", "secret"]);
 			expect(versions).toEqual(["2023-06-01", "2023-06-01"]);
-			expect(bodies[0]?.system).toBe("system");
+			expect(bodies[0]?.system).toEqual([{ type: "text", text: "system", cache_control: { type: "ephemeral" } }]);
+			expect(JSON.stringify(bodies[0]?.tools)).toContain("cache_control");
 			expect(bodies[0]?.thinking).toEqual({ type: "adaptive" });
 			expect(bodies[0]?.output_config).toEqual({ effort: "high" });
 			expect(bodies[0]?.max_tokens).toBe(128_000);

@@ -50,6 +50,44 @@ describe("workspace shell approval", () => {
 	});
 });
 
+describe("workspace shell mutation classification", () => {
+	it("distinguishes read-only shell probes from workspace-mutating commands", async () => {
+		const { directory, tool } = await createWorkspaceTool("shell");
+		await Bun.write(path.join(directory, "input.txt"), "value");
+		const read = await tool.execute("read-shell", { command: "cat input.txt && wc -c input.txt" });
+		expect(read.details?.workspaceMutationRisk).toBe("none");
+		const write = await tool.execute("write-shell", { command: "printf changed > output.txt" });
+		expect(write.details?.workspaceMutationRisk).toBe("possible");
+	});
+});
+
+describe("workspace verification command recognition", () => {
+	it("recognizes safe Python test runners and check scripts", () => {
+		expect(defineVerificationCheck("pytest", "python3 -m pytest tests/ -q")?.argv).toEqual([
+			"python3",
+			"-m",
+			"pytest",
+			"tests/",
+			"-q",
+		]);
+		expect(defineVerificationCheck("unittest", "python3 -m unittest discover -s tests -v")).toBeDefined();
+		expect(defineVerificationCheck("selfcheck", "python3 tools/selfcheck.py")).toBeDefined();
+		expect(defineVerificationCheck("unsafe", "python3 tools/migrate.py")).toBeUndefined();
+		expect(defineVerificationCheck("code", "python3 -c print(1)")).toBeUndefined();
+	});
+});
+
+describe("workspace shell temporary files", () => {
+	it("supports heredocs inside the macOS sandbox without leaking temporary files", async () => {
+		const { tool } = await createWorkspaceTool("shell");
+		const result = await tool.execute("heredoc", {
+			command: "python3 - <<'PY'\nprint('HEREDOC_OK')\nPY",
+		});
+		expect(result.isError).not.toBe(true);
+		expect(resultText(result)).toContain("HEREDOC_OK");
+	});
+});
+
 describe("workspace process isolation", () => {
 	it("does not pass unrelated host secrets to workspace shell commands", async () => {
 		const { directory, tool } = await createWorkspaceTool("shell");

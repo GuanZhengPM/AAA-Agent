@@ -56,6 +56,10 @@ function completedCheckpoint(task: string) {
 	});
 }
 
+function stripTerminalControls(text: string): string {
+	return text.replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
 function outputStream(): { stream: PassThrough; text(): string } {
 	const stream = new PassThrough();
 	Object.assign(stream, { isTTY: true, columns: 120 });
@@ -194,7 +198,7 @@ describe("interactive terminal lifecycle", () => {
 				return output.text();
 			};
 
-			const cancelledOutput = await runLifecycle(false);
+			const cancelledOutput = stripTerminalControls(await runLifecycle(false));
 			expect(cancelledOutput).toContain("Current task cancelled; session remains recoverable.\n\nyou ›");
 			await runLifecycle(true);
 		} finally {

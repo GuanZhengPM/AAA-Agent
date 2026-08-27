@@ -5,8 +5,13 @@ import {
 	type AgentTurnResult,
 	calculateModelUsageCost,
 	createEmptyUsageMetrics,
+	createProviderAttemptSignal,
+	isHardQuotaFailure,
 	isRecord,
 	type Model,
+	ProviderHttpError,
+	providerErrorCode,
+	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
 import { z } from "zod/v4";
@@ -44,9 +49,12 @@ export function createResponsesRequestBody(options: AgentTurnOptions): Record<st
 		input: options.input,
 		stream: true,
 		store: false,
+		// Stable across an interactive session. Providers that implement OpenAI
+		// prompt caching can reuse the long system/history/tool prefix.
+		...(options.model.api === "openai-responses" ? { prompt_cache_key: options.sessionId } : {}),
 		...(reasoning ? { reasoning } : {}),
 		...(options.serviceTier ? { service_tier: options.serviceTier } : {}),
-		...(options.maxOutputTokens !== undefined
+		...(options.maxOutputTokens !== undefined && options.model.api !== "codex-responses"
 			? {
 					max_output_tokens: Math.min(
 						options.maxOutputTokens,
@@ -135,17 +143,27 @@ function usageFromResponse(model: Model, response: Record<string, unknown>): Usa
 	const inputDetails = isRecord(usage.input_tokens_details) ? usage.input_tokens_details : {};
 	const outputDetails = isRecord(usage.output_tokens_details) ? usage.output_tokens_details : {};
 	const result = createEmptyUsageMetrics();
-	result.inputTokens = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
-	result.outputTokens = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
+	const totalInput = typeof usage.input_tokens === "number" ? usage.input_tokens : 0;
 	result.cacheReadTokens = typeof inputDetails.cached_tokens === "number" ? inputDetails.cached_tokens : 0;
+	result.inputTokens = Math.max(0, totalInput - result.cacheReadTokens);
+	const totalOutput = typeof usage.output_tokens === "number" ? usage.output_tokens : 0;
 	result.reasoningTokens = typeof outputDetails.reasoning_tokens === "number" ? outputDetails.reasoning_tokens : 0;
+	result.outputTokens = Math.max(0, totalOutput - result.reasoningTokens);
 	result.costUsd = calculateModelUsageCost(model, result);
 	return result;
 }
 
 async function responseError(label: string, response: Response): Promise<Error> {
+	const retryAfterMs = retryAfterMilliseconds(response);
 	const text = (await response.text()).slice(0, MAX_ERROR_BODY);
-	return new Error(`${label} request failed (${response.status} ${response.statusText}): ${text}`);
+	const providerCode = providerErrorCode(text);
+	const message = `${label} request failed (${response.status} ${response.statusText}): ${text}`;
+	return new ProviderHttpError(message, {
+		status: response.status,
+		...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+		...(providerCode ? { providerCode } : {}),
+		hardQuota: isHardQuotaFailure(message, providerCode),
+	});
 }
 
 export interface ResponsesTransportOptions {
@@ -156,34 +174,37 @@ export interface ResponsesTransportOptions {
 	refresh?: () => Promise<Headers>;
 }
 
-async function sendRequest(options: ResponsesTransportOptions, headers: Headers): Promise<Response> {
-	return fetch(options.url, {
+interface ResponsesAttempt {
+	response: Response;
+	signal: AbortSignal;
+}
+
+async function sendRequest(options: ResponsesTransportOptions, headers: Headers): Promise<ResponsesAttempt> {
+	const signal = createProviderAttemptSignal(options.turn.signal);
+	const response = await fetch(options.url, {
 		method: "POST",
 		headers,
 		body: JSON.stringify(createResponsesRequestBody(options.turn)),
-		signal: options.turn.signal,
+		signal,
 	});
+	return { response, signal };
 }
 
 export async function runResponsesTransport(options: ResponsesTransportOptions): Promise<AgentTurnResult> {
 	let headers = options.headers;
-	let response = await sendRequest(options, headers);
-	if (response.status === 401 && options.refresh) {
-		await response.body?.cancel();
+	let attempt = await sendRequest(options, headers);
+	if (attempt.response.status === 401 && options.refresh) {
+		await attempt.response.body?.cancel();
 		headers = await options.refresh();
-		response = await sendRequest(options, headers);
+		attempt = await sendRequest(options, headers);
 	}
-	for (let attempt = 0; attempt < 2 && (response.status === 429 || response.status >= 500); attempt += 1) {
-		await response.body?.cancel();
-		await Bun.sleep(500 * 2 ** attempt);
-		response = await sendRequest(options, headers);
-	}
+	const { response, signal } = attempt;
 	if (!response.ok) throw await responseError(options.label, response);
 	if (!response.body) throw new Error(`${options.label} response had no event stream`);
 
 	const completedItems: Record<string, unknown>[] = [];
 	let completedResponse: Record<string, unknown> | undefined;
-	for await (const event of readSseJson(response.body, options.turn.signal)) {
+	for await (const event of readSseJson(response.body, signal)) {
 		const type = typeof event.data.type === "string" ? event.data.type : event.event;
 		if (type === "response.output_text.delta" && typeof event.data.delta === "string") {
 			options.turn.onTextDelta?.(event.data.delta);

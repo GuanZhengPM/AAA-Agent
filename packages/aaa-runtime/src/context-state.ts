@@ -91,6 +91,10 @@ function enforceContextBudget(state: StructuredContextState): StructuredContextS
 		if (removeOldest(state.userGoals, 1)) continue;
 		if (removeOldest(state.artifacts)) continue;
 		if (removeOldest(state.verifiedFacts)) continue;
+		if (state.ledger && state.ledger.length > 0) {
+			state.ledger.shift();
+			continue;
+		}
 		if (removeOldest(state.remainingGoals)) continue;
 		if (removeOldest(state.openRisks)) continue;
 		break;
@@ -140,6 +144,7 @@ export function updateStructuredContextState(
 		verifiedFacts: uniqueFacts([...(previous?.verifiedFacts ?? []), ...checkpoint.facts]),
 		artifacts: uniqueEvidence([...(previous?.artifacts ?? []), ...checkpoint.artifacts], MAX_ARTIFACTS),
 		openRisks: uniqueStrings(openRisks, MAX_OPEN_RISKS),
+		...(previous?.ledger ? { ledger: previous.ledger.slice() } : {}),
 		...(checkpoint.recoveryGuidance ? { recoveryGuidance: compactText(checkpoint.recoveryGuidance) } : {}),
 		updatedAt: checkpoint.updatedAt,
 	});

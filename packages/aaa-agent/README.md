@@ -35,7 +35,8 @@ AAA Agent（`aaa`）是一个使用 Bun 和 TypeScript 开发的终端编程 Age
 - **受控并行**：主 Agent 负责写入，Subagent 只读；
 - **审计与验证**：完成状态必须绑定运行时证据；
 - **任务恢复**：长任务保存 checkpoint，可在中断后继续；
-- **持久会话**：在本地保存会话、模型偏好和能力记录。
+- **持久会话**：append-only 保存完整 transcript，并按模型/成本动态压缩实时工作集；
+- **Provider 效率**：稳定会话缓存、统一退避重试、流式响应和 Provider 级并发限制。
 
 项目由五个 Bun workspace 包组成，不依赖服务端或数据库。
 
@@ -122,6 +123,7 @@ aaa
 ```sh
 aaa run "解释认证请求从 CLI 到 provider 的调用路径"
 aaa run --effort high "修复 parser 回归并运行相关测试"
+aaa run --subagent-model openai-codex/gpt-5.4-mini "并行检查三个独立模块"
 cat task.txt | aaa run --cwd /path/to/project
 ```
 
@@ -155,7 +157,7 @@ aaa route "检查认证和存储实现，并列出风险"
 
 因此：
 
-- 交互会话中，Agent 发起的 Shell 命令每次都要确认；
+- 交互会话中，Agent 发起的 Shell 命令需要确认；输入 `a` 可仅对当前 session 中“同 cwd + 完全相同命令”复用授权；
 - `aaa run` 默认使用 `--shell-policy deny`；
 - 自动化场景必须显式选择策略：
 
@@ -190,7 +192,7 @@ aaa-agent                  对外 SDK 和 `aaa` 命令
 | `guided` | 多步骤、多文件、长上下文或高风险 | 保存目标状态，执行后审计 |
 | `orchestrated` | 用户明确要求并行，或任务带依赖图 | 只读 Subagent、DAG 调度、严格验证 |
 
-Guided 和 Orchestrated 任务使用有界的 `execute → audit → checkpoint → recover` 循环，最多自动修复一次。Primary、Verifier 和 Subagent 共享同一任务 token 余额，单次 Verifier 最多使用总额的 20%。写入后的最新确定性检查可以直接完成 targeted 验证；后续修改会立即使旧检查失效。执行器可以提出“已完成”，但只有绑定到宿主证据的审计结果才能提交目标。长期保存的 verified facts 必须由独立验证或确定性宿主证据明确给出，不会从普通日志里自动拼出来。
+Guided 和 Orchestrated 任务使用有界的 `execute → audit → checkpoint → recover` 循环。确定性 completion gate 失败会先把真实 rc/stdout/stderr 回灌同一个 Agent loop，只有仍未解决时才使用外层恢复轮。Primary、Verifier 和 Subagent 共享同一任务 token 余额，单次 Verifier 最多使用总额的 20%。写入后的最新确定性检查可以直接完成 targeted 验证；后续修改会立即使旧检查失效。执行器可以提出“已完成”，但只有绑定到宿主证据的审计结果才能提交目标。长期保存的 verified facts 必须由独立验证或确定性宿主证据明确给出，不会从普通日志里自动拼出来。
 
 ### 本地数据
 
@@ -201,7 +203,7 @@ Guided 和 Orchestrated 任务使用有界的 `execute → audit → checkpoint 
 ├── credentials.json   OAuth 凭据
 ├── models.json        自定义模型，可选
 ├── state.json         默认模型和本地能力记录
-└── sessions/          可恢复会话
+└── sessions/          小型 metadata JSON + append-only transcript JSONL
 ```
 
 可以通过 `AAA_AGENT_HOME=/path/to/dir` 改到其他位置。凭据和会话可能包含敏感信息，不要提交到仓库。
@@ -248,7 +250,8 @@ Key features:
 - **Controlled parallelism**: the primary Agent writes; Subagents are read-only;
 - **Audit and verification**: completion must be backed by runtime evidence;
 - **Task recovery**: long-running tasks persist checkpoints and resume after interruption;
-- **Persistent sessions**: stores sessions, model preferences, and capability observations locally.
+- **Persistent sessions**: append-only full transcripts with a model/cost-aware live working set;
+- **Provider efficiency**: stable cache affinity, unified retries, streaming, and provider-level concurrency limits.
 
 The project is organized as five Bun workspace packages and requires no server or database.
 
@@ -335,6 +338,7 @@ One-shot tasks:
 ```sh
 aaa run "Explain how authentication reaches the provider client"
 aaa run --effort high "Fix the parser regression and run the relevant test"
+aaa run --subagent-model openai-codex/gpt-5.4-mini "Inspect three independent modules in parallel"
 cat task.txt | aaa run --cwd /path/to/project
 ```
 
@@ -368,7 +372,7 @@ File tools reject paths and symlinks that escape the workspace. Shell is differe
 
 For that reason:
 
-- Agent-requested Shell commands require confirmation in interactive sessions;
+- Agent-requested Shell commands require confirmation in interactive sessions; entering `a` reuses approval only for the exact same command and cwd in that session;
 - `aaa run` defaults to `--shell-policy deny`;
 - automation must opt into another policy explicitly:
 
@@ -403,7 +407,7 @@ Tasks use one of three routes:
 | `guided` | Multi-step, multi-file, long-context, or risky work | Durable goals and an audit after execution |
 | `orchestrated` | Explicit parallel work or a supplied dependency graph | Read-only Subagents, DAG scheduling, strict verification |
 
-Guided and Orchestrated tasks run a bounded `execute → audit → checkpoint → recover` loop with at most one automatic repair. Primary, Verifier, and Subagent sessions share one task-wide token balance, and each Verifier session is capped at 20% of the total. A current deterministic check after the latest write can satisfy targeted verification without another model session; any later write invalidates that check. The executor may claim completion, but goals are committed only when the audit cites evidence recorded by the host. Durable verified facts must come from independent verification or deterministic host evidence, never from generic logs.
+Guided and Orchestrated tasks run a bounded `execute → audit → checkpoint → recover` loop. A deterministic completion-gate failure first feeds real rc/stdout/stderr back into the same Agent loop; an outer recovery round is used only if that remains unresolved. Primary, Verifier, and Subagent sessions share one task-wide token balance, and each Verifier session is capped at 20% of the total. A current deterministic check after the latest write can satisfy targeted verification without another model session; any later write invalidates that check. The executor may claim completion, but goals are committed only when the audit cites evidence recorded by the host. Durable verified facts must come from independent verification or deterministic host evidence, never from generic logs.
 
 ### Local data
 
@@ -414,7 +418,7 @@ AAA Agent stores local data under `~/.aaa-agent/` by default:
 ├── credentials.json   OAuth credentials
 ├── models.json        Optional custom models
 ├── state.json         Defaults and local capability observations
-└── sessions/          Resumable sessions
+└── sessions/          Small metadata JSON + append-only transcript JSONL
 ```
 
 Set `AAA_AGENT_HOME=/path/to/dir` to move it elsewhere. Credentials and sessions may contain sensitive data and should not be committed.

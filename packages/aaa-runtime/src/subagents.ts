@@ -120,11 +120,26 @@ export class BoundedSubagentScheduler {
 				pending.delete(task.id);
 			}
 			const width = Math.max(1, policy.budget.subagentMaxParallel);
-			const fairTokenLimit = Math.max(1, Math.ceil(policy.budget.subagentTotalTokens / width));
+			const activeWidth = Math.max(1, Math.min(width, runnable.length));
+			const fairTokenLimit = Math.max(1, Math.ceil(remainingTokens / activeWidth));
 			const batchRun = await mapWithConcurrencyLimit(
 				runnable,
 				width,
 				async (task, _index, workerSignal) => {
+					const dependencyContext = (task.dependencies ?? []).flatMap(dependencyId => {
+						const dependency = completed.get(dependencyId);
+						if (!dependency) return [];
+						return dependency.findings.map(
+							finding => `- ${dependencyId} [confidence=${finding.confidence.toFixed(2)}]: ${finding.summary}`,
+						);
+					});
+					const runnableTask =
+						dependencyContext.length > 0
+							? {
+									...task,
+									prompt: `${task.prompt}\n\n<dependency-findings>\n${dependencyContext.join("\n").slice(0, 8_000)}\n</dependency-findings>`,
+								}
+							: task;
 					const requestedTokens = Math.max(
 						1,
 						Math.min(task.estimatedTokens ?? policy.budget.subagentMaxTokens, policy.budget.subagentMaxTokens),
@@ -134,7 +149,7 @@ export class BoundedSubagentScheduler {
 					remainingTokens -= tokenLimit;
 					spawns += 1;
 					const result = await this.#runTask(
-						task,
+						runnableTask,
 						model,
 						profile,
 						policy.budget.subagentMaxTurns,

@@ -42,7 +42,7 @@ import type { ShellApprovalRequest } from "@aaa-agent/workspace";
 import { createHistorySearchTool } from "./history-tool";
 import { runInteractiveTerminal } from "./interactive";
 import { formatRunReport, summarizeRuns } from "./run-report";
-import { type AdaptiveVerifierOptions, runAdaptiveTask } from "./runtime";
+import { type AdaptiveSubagentOptions, type AdaptiveVerifierOptions, runAdaptiveTask } from "./runtime";
 import {
 	findRecentInteractiveSession,
 	listInteractiveSessions,
@@ -57,8 +57,8 @@ const HELP = `AAA Agent (3A Agent) — interactive, model-aware coding agent
 
 Usage:
   aaa
-  aaa chat [--resume [id] | --new] [--model <id>] [--verifier-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--cwd <path>]
-  aaa run [--model <id>] [--verifier-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--shell-policy <deny|ask|sandbox|allow>] [--cwd <path>] [--verbose] <task>
+  aaa chat [--resume [id] | --new] [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--cwd <path>]
+  aaa run [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--shell-policy <deny|ask|sandbox|allow>] [--cwd <path>] [--verbose] <task>
   aaa sessions [query]
   aaa models
   aaa providers
@@ -81,6 +81,7 @@ type ShellPolicy = (typeof SHELL_POLICIES)[number];
 interface RunArguments {
 	modelId?: string;
 	verifierModelId?: string;
+	subagentModelId?: string;
 	thinkingMode?: ThinkingMode;
 	serviceTier?: ServiceTier;
 	cwd: string;
@@ -115,6 +116,7 @@ function parseShellPolicy(value: string): ShellPolicy {
 async function parseRunArguments(args: string[], allowStdin: boolean): Promise<RunArguments> {
 	let modelId: string | undefined;
 	let verifierModelId: string | undefined;
+	let subagentModelId: string | undefined;
 	let thinkingMode: ThinkingMode | undefined;
 	let serviceTier: ServiceTier | undefined;
 	let cwd = process.cwd();
@@ -133,6 +135,12 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 			const value = args[++index];
 			if (!value) throw new Error("--verifier-model requires a value");
 			verifierModelId = value;
+			continue;
+		}
+		if (arg === "--subagent-model") {
+			const value = args[++index];
+			if (!value) throw new Error("--subagent-model requires a value");
+			subagentModelId = value;
 			continue;
 		}
 		if (arg === "--effort") {
@@ -176,6 +184,7 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 	return {
 		...(modelId ? { modelId } : {}),
 		...(verifierModelId ? { verifierModelId } : {}),
+		...(subagentModelId ? { subagentModelId } : {}),
 		...(thinkingMode ? { thinkingMode } : {}),
 		...(serviceTier ? { serviceTier } : {}),
 		cwd,
@@ -188,6 +197,7 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 async function parseSessionArguments(args: string[]): Promise<SessionArguments> {
 	let modelId: string | undefined;
 	let verifierModelId: string | undefined;
+	let subagentModelId: string | undefined;
 	let thinkingMode: ThinkingMode | undefined;
 	let serviceTier: ServiceTier | undefined;
 	let cwd = process.cwd();
@@ -203,6 +213,10 @@ async function parseSessionArguments(args: string[]): Promise<SessionArguments> 
 			const value = args[++index];
 			if (!value) throw new Error("--verifier-model requires a value");
 			verifierModelId = value;
+		} else if (arg === "--subagent-model") {
+			const value = args[++index];
+			if (!value) throw new Error("--subagent-model requires a value");
+			subagentModelId = value;
 		} else if (arg === "--effort") {
 			const value = args[++index];
 			if (!value) throw new Error("--effort requires a value");
@@ -235,6 +249,7 @@ async function parseSessionArguments(args: string[]): Promise<SessionArguments> 
 	return {
 		...(modelId ? { modelId } : {}),
 		...(verifierModelId ? { verifierModelId } : {}),
+		...(subagentModelId ? { subagentModelId } : {}),
 		...(thinkingMode ? { thinkingMode } : {}),
 		...(serviceTier ? { serviceTier } : {}),
 		...(resume ? { resume } : {}),
@@ -275,6 +290,22 @@ async function resolveVerifierOptions(
 	const model = await resolveSelectedModel(modelId);
 	if (!modelAuthenticationReady(model, authSession)) {
 		throw new Error(`Verifier model ${model.provider}/${model.id} is not authenticated.`);
+	}
+	return {
+		model,
+		provider: createAgentTurnProvider(model, authSession),
+		reasoningConfig: resolveDefaultThinkingMode(model),
+	};
+}
+
+async function resolveSubagentOptions(
+	modelId: string | undefined,
+	authSession: CodexAuthSession,
+): Promise<AdaptiveSubagentOptions | undefined> {
+	if (!modelId) return undefined;
+	const model = await resolveSelectedModel(modelId);
+	if (!modelAuthenticationReady(model, authSession)) {
+		throw new Error(`Subagent model ${model.provider}/${model.id} is not authenticated.`);
 	}
 	return {
 		model,
@@ -411,6 +442,7 @@ async function runTask(args: string[]): Promise<void> {
 	try {
 		const provider = createAgentTurnProvider(model, authSession);
 		const verifier = await resolveVerifierOptions(parsed.verifierModelId, authSession);
+		const subagent = await resolveSubagentOptions(parsed.subagentModelId, authSession);
 		const result = await runAdaptiveTask({
 			task: parsed.task,
 			model,
@@ -420,6 +452,7 @@ async function runTask(args: string[]): Promise<void> {
 			approveShell,
 			...(serviceTier ? { serviceTier } : {}),
 			...(verifier ? { verifier } : {}),
+			...(subagent ? { subagent } : {}),
 			capabilities,
 			overlays,
 			additionalTools: [createHistorySearchTool(parsed.cwd)],
@@ -464,6 +497,7 @@ async function startInteractive(args: string[]): Promise<void> {
 	);
 	try {
 		const verifier = await resolveVerifierOptions(parsed.verifierModelId, authSession);
+		const subagent = await resolveSubagentOptions(parsed.subagentModelId, authSession);
 		await runInteractiveTerminal({
 			model,
 			models,
@@ -501,11 +535,13 @@ async function startInteractive(args: string[]): Promise<void> {
 					task: request.task,
 					model: request.model,
 					provider,
+					sessionId: request.sessionId,
 					cwd: request.cwd,
 					reasoningConfig: request.thinkingMode,
 					...(request.serviceTier ? { serviceTier: request.serviceTier } : {}),
 					approveShell: request.approveShell,
 					...(verifier ? { verifier } : {}),
+					...(subagent ? { subagent } : {}),
 					capabilities,
 					overlays,
 					additionalTools: [createHistorySearchTool(request.cwd)],

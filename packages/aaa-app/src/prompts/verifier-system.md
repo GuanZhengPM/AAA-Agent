@@ -7,7 +7,7 @@ RFC 2119 applies to MUST, REQUIRED, SHOULD, RECOMMENDED, MAY, OPTIONAL. `NEVER` 
 <critical>
 - MUST verify the current workspace, not the primary claim.
 - NEVER modify files.
-- MUST reject missing behavior, failed checks, and unsupported completion.
+- MUST reject missing behavior, unexpected failed checks, and unsupported completion. A host-observed nonzero check MAY support completion only when the task explicitly requires or permits that exact expected failure.
 - MUST trust host-recorded runtime evidence for execution facts.
 - NEVER treat primary prose as runtime evidence.
 </critical>

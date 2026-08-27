@@ -10,7 +10,11 @@ import type {
 } from "./types";
 
 export function maxLongRunRounds(snapshot: AdaptivePolicySnapshot): number {
-	return snapshot.route.policy.lane === "direct" ? 1 : 2;
+	if (snapshot.route.policy.lane !== "direct") return 2;
+	// Verified tasks need one extra round so an honest host-gate downgrade can
+	// be repaired within the same user turn instead of failing terminally.
+	const verification = snapshot.route.policy.verification;
+	return verification && verification !== "none" ? 2 : 1;
 }
 
 export function createLongRunCheckpoint(options: {

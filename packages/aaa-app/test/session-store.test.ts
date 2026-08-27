@@ -10,6 +10,7 @@ import {
 	findRecentInteractiveSession,
 	getSessionPath,
 	getSessionsDir,
+	getSessionTranscriptPath,
 	listInteractiveSessions,
 	loadInteractiveSession,
 	saveInteractiveSession,
@@ -97,7 +98,12 @@ describe("interactive session persistence", () => {
 			expect(await listInteractiveSessions(workspace)).toEqual([
 				expect.objectContaining({ id: session.id, turns: 1, preview: "repair the lifecycle" }),
 			]);
-			expect(await fs.readdir(getSessionsDir())).toEqual([`${session.id}.json`]);
+			expect((await fs.readdir(getSessionsDir())).sort()).toEqual(
+				[`${session.id}.json`, `${session.id}.transcript.jsonl`].sort(),
+			);
+			const metadata = await Bun.file(getSessionPath(session.id)).json();
+			expect(metadata.messages).toEqual([]);
+			expect((await Bun.file(getSessionTranscriptPath(session.id)).text()).trim().split("\n")).toHaveLength(2);
 		});
 	});
 

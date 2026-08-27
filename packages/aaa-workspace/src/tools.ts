@@ -11,9 +11,11 @@ import searchDescription from "./prompts/tools/search.md" with { type: "text" };
 import shellDescription from "./prompts/tools/shell.md" with { type: "text" };
 import writeDescription from "./prompts/tools/write.md" with { type: "text" };
 
-const MAX_TOOL_OUTPUT = 30_000;
+// Keep replay cheap; callers can issue narrower read/search commands for more.
+// Shell still preserves head+tail and exact omitted-byte metadata.
+const MAX_TOOL_OUTPUT = 16_000;
 const MAX_LINE_LENGTH = 2_000;
-const MAX_SHELL_STREAM_CAPTURE = 14_000;
+const MAX_SHELL_STREAM_CAPTURE = 7_500;
 
 const SAFE_ENVIRONMENT_KEYS = new Set([
 	"APPDATA",
@@ -148,13 +150,22 @@ async function runCapturedProcess(
 	extraDetails: Record<string, unknown> = {},
 ): Promise<ToolResult> {
 	const detached = process.platform !== "win32";
+	const environment = childProcessEnvironment();
+	const privateTemporaryDirectory =
+		process.platform === "darwin" ? await fs.mkdtemp(path.join(os.tmpdir(), "aaa-shell-")) : undefined;
+	if (privateTemporaryDirectory) {
+		environment.TMPDIR = `${privateTemporaryDirectory}${path.sep}`;
+		environment.TMP = privateTemporaryDirectory;
+		environment.TEMP = privateTemporaryDirectory;
+		environment.TMPPREFIX = path.join(privateTemporaryDirectory, "zsh");
+	}
 	const child = Bun.spawn(argv, {
 		cwd,
 		stdin: "ignore",
 		stdout: "pipe",
 		stderr: "pipe",
 		detached,
-		env: childProcessEnvironment(),
+		env: environment,
 	});
 	const killProcessTree = (force: boolean): void => {
 		try {
@@ -199,10 +210,54 @@ async function runCapturedProcess(
 		};
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		if (privateTemporaryDirectory) {
+			await fs.rm(privateTemporaryDirectory, { recursive: true, force: true });
+		}
 	}
 }
 
 const CHECK_NAME_PATTERN = /(?:^|[-_:])(test|check|lint|build|typecheck)(?:$|[-_:])/i;
+const SHELL_MUTATION_PATTERN =
+	/(?:^|\s)(?:rm|mv|cp|mkdir|rmdir|touch|chmod|chown|ln|install|truncate|dd|patch)(?:\s|$)|\bsed\s+-[^\s]*i\b|\bperl\s+-[^\s]*i\b|\bgit\s+(?:apply|checkout|restore|reset|clean|commit|merge|rebase)\b|\b(?:npm|pnpm|yarn|bun)\s+(?:install|add|remove|update)\b|(?:^|[^<])>{1,2}(?!&)/i;
+const READ_ONLY_SHELL_COMMANDS = new Set([
+	"[",
+	"cat",
+	"echo",
+	"env",
+	"false",
+	"find",
+	"git",
+	"grep",
+	"head",
+	"ls",
+	"od",
+	"printf",
+	"pwd",
+	"rg",
+	"stat",
+	"tail",
+	"test",
+	"true",
+	"wc",
+	"which",
+	"xxd",
+]);
+
+function shellWorkspaceMutationRisk(command: string): "none" | "possible" {
+	if (SHELL_MUTATION_PATTERN.test(command)) return "possible";
+	if (defineVerificationCheck("probe", command)) return "none";
+	const segments = command.split(/&&|\|\||[;|]/);
+	for (const segment of segments) {
+		const executable = segment
+			.trim()
+			.replace(/^(?:if|then|else|elif|while|until|do)\s+/, "")
+			.match(/^([^\s]+)/)?.[1];
+		if (!executable || ["fi", "done"].includes(executable)) continue;
+		if (READ_ONLY_SHELL_COMMANDS.has(path.basename(executable))) continue;
+		return "possible";
+	}
+	return "none";
+}
 
 export function defineVerificationCheck(id: string, command: string): VerificationCheck | undefined {
 	const tokens = command.trim().split(/\s+/);
@@ -211,7 +266,13 @@ export function defineVerificationCheck(id: string, command: string): Verificati
 	const args = tokens.slice(1);
 	const first = args[0] ?? "";
 	const second = args[1] ?? "";
+	const pythonExecutable = /^(?:python(?:3(?:\.\d+)*)?|py)$/.test(executable);
+	const pythonCheck =
+		pythonExecutable &&
+		((first === "-m" && ["pytest", "unittest"].includes(second)) ||
+			(/\.py$/i.test(first) && /(?:test|check|lint)/i.test(path.basename(first))));
 	const allowed =
+		pythonCheck ||
 		(executable === "bun" && (first === "test" || (first === "run" && CHECK_NAME_PATTERN.test(second)))) ||
 		(["npm", "pnpm", "yarn"].includes(executable) &&
 			(first === "test" || (first === "run" && CHECK_NAME_PATTERN.test(second)))) ||
@@ -699,7 +760,10 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 			}
 			const timeout = AbortSignal.timeout(Math.round((params.timeoutSeconds ?? 120) * 1000));
 			const commandSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
-			return runCapturedProcess(launch.argv, root, commandSignal, { sandboxed: launch.sandboxed });
+			return runCapturedProcess(launch.argv, root, commandSignal, {
+				sandboxed: launch.sandboxed,
+				workspaceMutationRisk: shellWorkspaceMutationRisk(params.command),
+			});
 		},
 	};
 

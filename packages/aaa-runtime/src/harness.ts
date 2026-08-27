@@ -213,10 +213,13 @@ export class AdaptiveHarness {
 				requestedSubagents.length > 0 &&
 				this.#scheduler
 			) {
-				metrics.recordFirstAction();
 				const batch = await this.#scheduler.run(requestedSubagents, request.model, profile, route.policy, signal);
 				subagentResults = batch.results;
-				metrics.recordSubagents(batch.spawns, batch.usage);
+				metrics.recordSubagents(
+					batch.spawns,
+					batch.usage,
+					batch.results.map(result => result.diagnostics),
+				);
 				this.#onEvent?.({ type: "subagents_completed", results: subagentResults });
 			}
 
@@ -242,7 +245,6 @@ export class AdaptiveHarness {
 					checkpoint.status = "running";
 					await persistCheckpoint();
 					throwIfAborted("Harness run", signal);
-					metrics.recordFirstAction();
 					const context = {
 						task: request.task,
 						model: request.model,
@@ -261,13 +263,24 @@ export class AdaptiveHarness {
 					};
 					primary = await runWithAbort("Primary execution", signal, () => this.#executor.execute(context));
 					throwIfAborted("Harness run", signal);
+					if (primary.diagnostics?.firstActionAt !== undefined) {
+						metrics.recordFirstAction(primary.diagnostics.firstActionAt);
+					}
 					metrics.recordUsage(primary.usage);
+					metrics.recordDiagnostics(primary.diagnostics);
 					if (primary.output.trim()) metrics.recordUsefulResult();
 					this.#onEvent?.({ type: "primary_completed", result: primary });
 					if (primary.workspaceMutated && route.policy.verification === "none") {
 						route.policy.verification = "targeted";
 						checkpoint.policySnapshot.route.policy.verification = "targeted";
-					} else if (primary.workspaceMutated === false && route.policy.verification === "targeted") {
+					} else if (
+						primary.workspaceMutated === false &&
+						route.policy.verification === "targeted" &&
+						// Host-gate hardening: a RECOVERY round (one that follows a failed
+						// verification) may not drop verification just because the model
+						// avoided mutations this time — otherwise claims alone complete tasks.
+						checkpoint.currentRound <= 0
+					) {
 						route.policy.verification = "none";
 						checkpoint.policySnapshot.route.policy.verification = "none";
 					}
@@ -304,7 +317,7 @@ export class AdaptiveHarness {
 									recommendedRecovery: "Configure an independent verifier before resuming.",
 								};
 						audit = createAuditReport(verification, primary, claimedGoalIds);
-						if (verifier) metrics.recordVerification(verification.usage);
+						if (verifier) metrics.recordVerification(verification.usage, verification.diagnostics);
 						this.#onEvent?.({ type: "verification_completed", result: verification });
 						throwIfAborted("Harness run", signal);
 						checkpoint.lastAudit = audit;

@@ -1,6 +1,9 @@
-import type { z } from "zod/v4";
+import { z } from "zod/v4";
+import { resolveWorkingContextCharacters } from "./context-budget";
+import { isRecord } from "./guards";
 import { activeTokenCount, addUsageMetrics, createEmptyUsageMetrics } from "./metrics";
 import type { AgentTurnProvider } from "./provider";
+import { withProviderPermit, withTransientRetry } from "./provider-retry";
 import type { AgentRunDiagnostics, Effort, Model, ServiceTier, UsageMetrics } from "./types";
 
 export interface ToolResultContent {
@@ -31,6 +34,8 @@ export interface AgentConversationMessage {
 export type AgentSessionEvent =
 	| { type: "turn_started"; turn: number }
 	| { type: "text_delta"; delta: string }
+	| { type: "provider_retry"; attempt: number; delayMs: number; error: string }
+	| { type: "completion_rejected"; feedback: string }
 	| { type: "policy_escalated"; reason: string; toolCount: number }
 	| { type: "context_compacted"; removedCharacters: number; retainedCharacters: number }
 	| { type: "tool_started"; callId: string; name: string; arguments: unknown }
@@ -43,6 +48,18 @@ export type AgentSessionEvent =
 			details?: Record<string, unknown>;
 			error?: string;
 	  };
+
+export interface AgentFinalizationCandidate {
+	text: string;
+	turn: number;
+	workspaceMutated: boolean;
+	unknownShellEffects: boolean;
+}
+
+export interface AgentFinalizationGateResult {
+	accepted: boolean;
+	feedback?: string;
+}
 
 export interface AgentSessionOptions {
 	model: Model;
@@ -63,8 +80,12 @@ export interface AgentSessionOptions {
 		maxConsecutiveToolFailures?: number;
 	};
 	serviceTier?: ServiceTier;
+	/** Stable logical session id enables provider affinity/cache reuse across turns. */
+	sessionId?: string;
 	signal: AbortSignal;
 	history?: readonly AgentConversationMessage[];
+	/** Deterministic host gate; rejection is fed back into the same tool loop. */
+	beforeFinalize?: (candidate: AgentFinalizationCandidate) => Promise<AgentFinalizationGateResult>;
 	onEvent?: (event: AgentSessionEvent) => void;
 }
 
@@ -121,6 +142,13 @@ function compactExcerpt(text: string, maximum: number): string {
 	return `${text.slice(0, head)}${marker}${text.slice(text.length - (available - head))}`;
 }
 
+function isDigestAnchor(item: Record<string, unknown> | undefined): boolean {
+	if (item?.type !== "message" || !Array.isArray(item.content)) return false;
+	return item.content.some(
+		part => isRecord(part) && typeof part.text === "string" && part.text.includes("<session-digest>"),
+	);
+}
+
 function compactAgentInput(
 	input: Record<string, unknown>[],
 	currentTaskInput: Record<string, unknown>,
@@ -129,10 +157,16 @@ function compactAgentInput(
 	const before = inputCharacters(input);
 	if (before <= targetCharacters) return { removedCharacters: 0, retainedCharacters: before };
 
+	const pinnedPrefix = isDigestAnchor(input[0]) && input[1]?.type === "message" ? 2 : 0;
 	while (inputCharacters(input) > targetCharacters) {
 		const currentTaskIndex = input.indexOf(currentTaskInput);
-		if (currentTaskIndex < 2 || input[0]?.type !== "message" || input[1]?.type !== "message") break;
-		input.splice(0, 2);
+		if (
+			currentTaskIndex - pinnedPrefix < 2 ||
+			input[pinnedPrefix]?.type !== "message" ||
+			input[pinnedPrefix + 1]?.type !== "message"
+		)
+			break;
+		input.splice(pinnedPrefix, 2);
 	}
 	if (inputCharacters(input) <= targetCharacters) {
 		const retainedCharacters = inputCharacters(input);
@@ -205,11 +239,15 @@ function compactAgentInput(
 	return { removedCharacters: Math.max(0, before - retainedCharacters), retainedCharacters };
 }
 
-function contextCharacterTarget(options: AgentSessionOptions): number {
-	return Math.max(
-		1,
-		Math.floor(options.model.contextWindow * CONTEXT_INPUT_CHARACTERS_PER_TOKEN) - options.systemPrompt.length,
-	);
+function contextCharacterTarget(
+	options: AgentSessionOptions,
+	charactersPerToken = CONTEXT_INPUT_CHARACTERS_PER_TOKEN,
+): number {
+	const hardTarget = Math.floor(options.model.contextWindow * charactersPerToken) - options.systemPrompt.length;
+	const economicTarget =
+		resolveWorkingContextCharacters(options.model.contextWindow, options.userPrompt.length, charactersPerToken) -
+		options.systemPrompt.length;
+	return Math.max(1, Math.min(hardTarget, economicTarget));
 }
 
 function assertInputFits(input: readonly Record<string, unknown>[], targetCharacters: number): void {
@@ -226,9 +264,11 @@ function remainingOutputTokens(
 	input: readonly Record<string, unknown>[],
 	usage: UsageMetrics,
 	phase: string,
+	charactersPerToken = CONTEXT_INPUT_CHARACTERS_PER_TOKEN,
 ): number | undefined {
 	if (options.policy.maxTotalTokens === undefined) return undefined;
-	const estimatedInputTokens = options.systemPrompt.length + inputCharacters(input);
+	// maxTotalTokens is a token budget; do not subtract raw characters from it.
+	const estimatedInputTokens = Math.ceil((options.systemPrompt.length + inputCharacters(input)) / charactersPerToken);
 	const remaining = options.policy.maxTotalTokens - activeTokenCount(usage) - estimatedInputTokens;
 	if (remaining <= 0) {
 		throw new Error(`Token limit ${options.policy.maxTotalTokens} exhausted before ${phase}.`);
@@ -236,12 +276,27 @@ function remainingOutputTokens(
 	return remaining;
 }
 
+function providerConcurrencyLimit(options: AgentSessionOptions): number {
+	if (options.model.maxConcurrentRequests !== undefined) return options.model.maxConcurrentRequests;
+	const identity = `${options.model.provider} ${options.model.family ?? ""} ${options.model.id}`;
+	if (/\b(?:glm|z-?ai|zai)\b/i.test(identity)) return 1;
+	if (options.model.authChannel === "local") return 8;
+	return 4;
+}
+
 export async function runAgentSession(options: AgentSessionOptions): Promise<AgentSessionResult> {
-	const sessionId = crypto.randomUUID();
+	const sessionId = options.sessionId ?? crypto.randomUUID();
 	const currentTaskInput = conversationInput({ role: "user", text: options.userPrompt });
 	const input: Record<string, unknown>[] = [...(options.history ?? []).map(conversationInput), currentTaskInput];
 	const usage = createEmptyUsageMetrics();
 	const diagnostics: AgentRunDiagnostics = {
+		startedAt: Date.now(),
+		providerRequests: 0,
+		providerRetries: 0,
+		providerLatencyMs: 0,
+		providerWaitMs: 0,
+		toolLatencyMs: 0,
+		contextCompactions: 0,
 		toolArgumentFailures: 0,
 		unknownToolCalls: 0,
 		toolExecutionFailures: 0,
@@ -258,9 +313,63 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 		options.policy.toolBudget,
 		options.policy.maxToolCalls ?? options.policy.toolBudget * 2,
 	);
-	const fullTools = options.escalationTools ?? options.tools;
+	const outputCache = new Map<string, string>();
+	const outputReadSchema = z.object({
+		callId: z.string(),
+		offset: z.number().int().nonnegative().optional(),
+		limit: z.number().int().positive().max(8_000).optional(),
+	});
+	const outputReadTool: AgentTool = {
+		name: "tool_output_read",
+		label: "Read tool output",
+		description:
+			"Read an exact character range from a previously compacted tool result. Use the callId shown in the compaction marker.",
+		parameters: outputReadSchema,
+		sideEffect: "none",
+		async execute(_toolCallId, rawParams) {
+			const { callId, offset = 0, limit = 4_000 } = outputReadSchema.parse(rawParams);
+			const original = outputCache.get(callId);
+			if (original === undefined) {
+				return {
+					content: [{ type: "text", text: `No cached tool output for callId '${callId}'.` }],
+					isError: true,
+				};
+			}
+			const end = Math.min(original.length, offset + limit);
+			return {
+				content: [
+					{
+						type: "text",
+						text: `[tool-output ${callId} chars ${offset}-${end}/${original.length}]\n${original.slice(offset, end)}`,
+					},
+				],
+				details: { callId, offset, end, totalCharacters: original.length },
+			};
+		},
+	};
+	let fullTools = [...(options.escalationTools ?? options.tools)];
+	let currentTools = [...options.tools];
+	const ensureOutputReadTool = (): void => {
+		if (!fullTools.some(tool => tool.name === outputReadTool.name)) fullTools = [...fullTools, outputReadTool];
+		if (!currentTools.some(tool => tool.name === outputReadTool.name))
+			currentTools = [...currentTools, outputReadTool];
+	};
+	const compactToolOutputForReplay = (callId: string, toolName: string, output: string): string => {
+		if (toolName === outputReadTool.name) return output;
+		const maximum = Math.max(
+			8_000,
+			Math.min(60_000, Math.floor(contextCharacterTarget(options, estimatedCharactersPerToken) * 0.25)),
+		);
+		if (output.length <= maximum) return output;
+		outputCache.set(callId, output);
+		ensureOutputReadTool();
+		const retrieval = `[full tool output cached: call tool_output_read with callId=${JSON.stringify(callId)}; totalCharacters=${output.length}]\n`;
+		const omitted = `\n… middle characters cached …\n`;
+		const available = Math.max(0, maximum - retrieval.length - omitted.length);
+		const head = Math.ceil(available * 0.7);
+		return `${retrieval}${output.slice(0, head)}${omitted}${output.slice(output.length - (available - head))}`;
+	};
 	const callCounts = new Map<string, number>();
-	let currentTools = options.tools;
 	let consecutiveFailures = 0;
 	let pendingRecovery = false;
 	let toolCalls = 0;
@@ -268,32 +377,98 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 	let toolTargetExceeded = false;
 	let workspaceMutated = false;
 	let unknownShellEffects = false;
+	let estimatedCharactersPerToken = CONTEXT_INPUT_CHARACTERS_PER_TOKEN;
+	let gateRecoveryTurns = 0;
+	const MAX_GATE_RECOVERY_TURNS = 2;
+	const providerGateKey = [
+		options.provider.provider,
+		options.provider.identity ?? "default",
+		options.model.baseUrl,
+	].join("\u0000");
+	const runProviderTurn = async (tools: AgentTool[], maxOutputTokens: number | undefined) =>
+		await withTransientRetry(
+			options.signal,
+			async () => {
+				diagnostics.providerRequests = (diagnostics.providerRequests ?? 0) + 1;
+				const startedAt = performance.now();
+				try {
+					const result = await withProviderPermit(
+						providerGateKey,
+						providerConcurrencyLimit(options),
+						options.signal,
+						() =>
+							options.provider.runTurn({
+								model: options.model,
+								systemPrompt: options.systemPrompt,
+								input,
+								tools,
+								effort: options.policy.reasoningEffort,
+								...(options.policy.disableReasoning ? { disableReasoning: true } : {}),
+								...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+								sessionId,
+								...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+								signal: options.signal,
+								onTextDelta(delta: string) {
+									diagnostics.firstTokenAt ??= Date.now();
+									options.onEvent?.({ type: "text_delta", delta });
+								},
+							}),
+						waitMs => {
+							diagnostics.providerWaitMs = (diagnostics.providerWaitMs ?? 0) + waitMs;
+						},
+					);
+					const observedInputTokens =
+						result.usage.inputTokens + result.usage.cacheReadTokens + result.usage.cacheWriteTokens;
+					if (observedInputTokens > 0) {
+						const toolCharacters = tools.reduce(
+							(total, tool) => total + tool.name.length + tool.description.length + 400,
+							0,
+						);
+						const observed =
+							(options.systemPrompt.length + inputCharacters(input) + toolCharacters) / observedInputTokens;
+						if (observed >= 0.5 && observed <= 8) {
+							estimatedCharactersPerToken = Math.max(
+								0.75,
+								Math.min(6, estimatedCharactersPerToken * 0.75 + observed * 0.25),
+							);
+							diagnostics.estimatedCharactersPerToken = estimatedCharactersPerToken;
+						}
+					}
+					return result;
+				} finally {
+					diagnostics.providerLatencyMs = (diagnostics.providerLatencyMs ?? 0) + (performance.now() - startedAt);
+				}
+			},
+			(attempt, delayMs, error) => {
+				diagnostics.providerRetries = (diagnostics.providerRetries ?? 0) + 1;
+				options.onEvent?.({
+					type: "provider_retry",
+					attempt,
+					delayMs,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			},
+		);
 
 	try {
-		for (let turn = 1; turn <= options.policy.maxTurns; turn += 1) {
+		for (let turn = 1; turn <= options.policy.maxTurns + gateRecoveryTurns; turn += 1) {
 			diagnostics.turns = turn;
 			options.onEvent?.({ type: "turn_started", turn });
-			const compaction = compactAgentInput(input, currentTaskInput, contextCharacterTarget(options));
+			const targetCharacters = contextCharacterTarget(options, estimatedCharactersPerToken);
+			const compaction = compactAgentInput(input, currentTaskInput, targetCharacters);
 			if (compaction.removedCharacters > 0) {
+				diagnostics.contextCompactions = (diagnostics.contextCompactions ?? 0) + 1;
 				options.onEvent?.({ type: "context_compacted", ...compaction });
 			}
-			assertInputFits(input, contextCharacterTarget(options));
-			const maxOutputTokens = remainingOutputTokens(options, input, usage, `turn ${turn}`);
-			const result = await options.provider.runTurn({
-				model: options.model,
-				systemPrompt: options.systemPrompt,
+			assertInputFits(input, targetCharacters);
+			const maxOutputTokens = remainingOutputTokens(
+				options,
 				input,
-				tools: currentTools,
-				effort: options.policy.reasoningEffort,
-				...(options.policy.disableReasoning ? { disableReasoning: true } : {}),
-				...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
-				sessionId,
-				...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
-				signal: options.signal,
-				onTextDelta(delta: string) {
-					options.onEvent?.({ type: "text_delta", delta });
-				},
-			});
+				usage,
+				`turn ${turn}`,
+				estimatedCharactersPerToken,
+			);
+			const result = await runProviderTurn(currentTools, maxOutputTokens);
 			addUsageMetrics(usage, result.usage);
 			if (options.policy.maxTotalTokens !== undefined && activeTokenCount(usage) > options.policy.maxTotalTokens) {
 				throw new Error(`Token limit ${options.policy.maxTotalTokens} exceeded by provider usage.`);
@@ -302,6 +477,28 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 			input.push(...replayableOutput(result.output));
 			if (result.toolCalls.length === 0) {
 				if (!lastText.trim()) throw new Error("Agent returned no final text");
+				const gate = await options.beforeFinalize?.({
+					text: lastText,
+					turn,
+					workspaceMutated,
+					unknownShellEffects,
+				});
+				if (gate && !gate.accepted) {
+					const feedback = gate.feedback?.trim() || "Host completion checks rejected this result.";
+					if (gateRecoveryTurns >= MAX_GATE_RECOVERY_TURNS) {
+						throw new Error(`Host completion gate remained unsatisfied: ${feedback}`);
+					}
+					gateRecoveryTurns += 1;
+					pendingRecovery = true;
+					options.onEvent?.({ type: "completion_rejected", feedback });
+					input.push(
+						conversationInput({
+							role: "user",
+							text: `<host-completion-gate>\n${feedback}\n</host-completion-gate>\nContinue using tools until every host check passes; do not merely restate the claim.`,
+						}),
+					);
+					continue;
+				}
 				return {
 					success: true,
 					output: lastText,
@@ -312,19 +509,65 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 				};
 			}
 
+			type PrefetchedTool = {
+				startedAt: number;
+				settled: Promise<{ result: ToolResult } | { error: unknown }>;
+			};
+			const prefetched = new Map<string, PrefetchedTool>();
+			if (result.toolCalls.length > 1 && toolCalls + result.toolCalls.length <= maxToolCalls) {
+				const candidates = result.toolCalls.map(call => {
+					try {
+						const tool = currentTools.find(candidate => candidate.name === call.name);
+						if (tool?.sideEffect !== "none") return undefined;
+						const decoded = parseToolArguments(call.arguments);
+						const parsed = tool.parameters.parse(decoded);
+						const signature = `${call.name}:${call.arguments}`;
+						if ((callCounts.get(signature) ?? 0) + 1 > maxRepeatedToolCalls) return undefined;
+						return { call, tool, parsed, decoded };
+					} catch {
+						return undefined;
+					}
+				});
+				if (candidates.every((candidate): candidate is NonNullable<typeof candidate> => Boolean(candidate))) {
+					diagnostics.firstActionAt ??= Date.now();
+					for (const candidate of candidates) {
+						options.onEvent?.({
+							type: "tool_started",
+							callId: candidate.call.callId,
+							name: candidate.call.name,
+							arguments: candidate.decoded,
+						});
+						const startedAt = performance.now();
+						prefetched.set(candidate.call.callId, {
+							startedAt,
+							settled: Promise.resolve(
+								candidate.tool.execute(candidate.call.callId, candidate.parsed, options.signal),
+							).then(
+								result => ({ result }),
+								error => ({ error }),
+							),
+						});
+					}
+				}
+			}
+
 			for (const call of result.toolCalls) {
 				toolCalls += 1;
-				const startedAt = performance.now();
+				const prepared = prefetched.get(call.callId);
+				const startedAt = prepared?.startedAt ?? performance.now();
+				diagnostics.firstActionAt ??= Date.now();
 				let rawArguments: unknown = call.arguments;
 				try {
 					rawArguments = parseToolArguments(call.arguments);
 				} catch {}
-				options.onEvent?.({
-					type: "tool_started",
-					callId: call.callId,
-					name: call.name,
-					arguments: rawArguments,
-				});
+				if (!prepared) {
+					options.onEvent?.({
+						type: "tool_started",
+						callId: call.callId,
+						name: call.name,
+						arguments: rawArguments,
+					});
+				}
 				let output: string;
 				let details: Record<string, unknown> | undefined;
 				let success = false;
@@ -347,6 +590,15 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 				} else if (repeated > maxRepeatedToolCalls) {
 					diagnostics.repeatedToolCalls += 1;
 					output = `Error: repeated identical tool call blocked after ${maxRepeatedToolCalls} attempts. Change the hypothesis or return the best supported final result.`;
+				} else if (prepared) {
+					const settled = await prepared.settled;
+					if ("result" in settled) {
+						output = toolResultText(settled.result);
+						details = settled.result.details;
+						success = settled.result.isError !== true;
+					} else {
+						output = `Error: ${settled.error instanceof Error ? settled.error.message : String(settled.error)}`;
+					}
 				} else {
 					let tool = currentTools.find(candidate => candidate.name === call.name);
 					if (!tool) {
@@ -386,7 +638,12 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 							details = toolResult.details;
 							success = toolResult.isError !== true;
 							if (success && tool.sideEffect === "workspace") workspaceMutated = true;
-							if (success && tool.sideEffect === "unrestricted") unknownShellEffects = true;
+							// A shell can mutate before returning a non-zero exit code; risk is
+							// therefore independent of the tool's terminal success bit.
+							if (tool.sideEffect === "unrestricted" && details?.workspaceMutationRisk !== "none") {
+								unknownShellEffects = true;
+								workspaceMutated = true;
+							}
 						} catch (error) {
 							output = `Error: ${error instanceof Error ? error.message : String(error)}`;
 						}
@@ -415,6 +672,8 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 						});
 					}
 				}
+				output = compactToolOutputForReplay(call.callId, call.name, output);
+				diagnostics.toolLatencyMs = (diagnostics.toolLatencyMs ?? 0) + (performance.now() - startedAt);
 				options.onEvent?.({
 					type: "tool_completed",
 					callId: call.callId,
@@ -435,33 +694,32 @@ export async function runAgentSession(options: AgentSessionOptions): Promise<Age
 		const finalTurn = options.policy.maxTurns + 1;
 		diagnostics.turns = finalTurn;
 		options.onEvent?.({ type: "turn_started", turn: finalTurn });
-		const compaction = compactAgentInput(input, currentTaskInput, contextCharacterTarget(options));
+		const targetCharacters = contextCharacterTarget(options, estimatedCharactersPerToken);
+		const compaction = compactAgentInput(input, currentTaskInput, targetCharacters);
 		if (compaction.removedCharacters > 0) {
+			diagnostics.contextCompactions = (diagnostics.contextCompactions ?? 0) + 1;
 			options.onEvent?.({ type: "context_compacted", ...compaction });
 		}
-		assertInputFits(input, contextCharacterTarget(options));
-		const maxOutputTokens = remainingOutputTokens(options, input, usage, "finalization");
-		const result = await options.provider.runTurn({
-			model: options.model,
-			systemPrompt: options.systemPrompt,
-			input,
-			tools: [],
-			effort: options.policy.reasoningEffort,
-			...(options.policy.disableReasoning ? { disableReasoning: true } : {}),
-			...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
-			sessionId,
-			...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
-			signal: options.signal,
-			onTextDelta(delta: string) {
-				options.onEvent?.({ type: "text_delta", delta });
-			},
-		});
+		assertInputFits(input, targetCharacters);
+		const maxOutputTokens = remainingOutputTokens(options, input, usage, "finalization", estimatedCharactersPerToken);
+		const result = await runProviderTurn([], maxOutputTokens);
 		addUsageMetrics(usage, result.usage);
 		if (options.policy.maxTotalTokens !== undefined && activeTokenCount(usage) > options.policy.maxTotalTokens) {
 			throw new Error(`Token limit ${options.policy.maxTotalTokens} exceeded by provider usage.`);
 		}
 		lastText = result.text;
 		if (!lastText.trim()) throw new Error(`Maximum execution turn count ${options.policy.maxTurns} exhausted`);
+		const finalGate = await options.beforeFinalize?.({
+			text: lastText,
+			turn: finalTurn,
+			workspaceMutated,
+			unknownShellEffects,
+		});
+		if (finalGate && !finalGate.accepted) {
+			throw new Error(
+				`Host completion gate remained unsatisfied at finalization: ${finalGate.feedback ?? "unknown requirement"}`,
+			);
+		}
 		return {
 			success: true,
 			output: lastText,

@@ -5,9 +5,14 @@ import {
 	type AgentTurnResult,
 	calculateModelUsageCost,
 	createEmptyUsageMetrics,
+	createProviderAttemptSignal,
+	isHardQuotaFailure,
 	isRecord,
 	type Model,
+	ProviderHttpError,
+	providerErrorCode,
 	resolveModelBaseUrl,
+	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
 import { runResponsesTransport, toolJsonSchema } from "./responses-transport";
@@ -23,11 +28,12 @@ function apiKeyFor(model: Model): string | undefined {
 	return apiKey;
 }
 
-function compatibleHeaders(apiKey: string | undefined): Headers {
+function compatibleHeaders(apiKey: string | undefined, sessionId?: string): Headers {
 	const headers = new Headers({
 		accept: "application/json",
 		"content-type": "application/json",
 		"User-Agent": "aaa-agent/0.4.0",
+		...(sessionId ? { "x-session-id": sessionId, "x-client-request-id": sessionId } : {}),
 	});
 	if (apiKey) headers.set("Authorization", `Bearer ${apiKey}`);
 	return headers;
@@ -83,13 +89,109 @@ function chatUsage(model: Model, raw: unknown): UsageMetrics {
 	const promptDetails = isRecord(usage.prompt_tokens_details) ? usage.prompt_tokens_details : {};
 	const completionDetails = isRecord(usage.completion_tokens_details) ? usage.completion_tokens_details : {};
 	const result = createEmptyUsageMetrics();
-	result.inputTokens = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
-	result.outputTokens = typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0;
+	const totalInput = typeof usage.prompt_tokens === "number" ? usage.prompt_tokens : 0;
 	result.cacheReadTokens = typeof promptDetails.cached_tokens === "number" ? promptDetails.cached_tokens : 0;
+	result.inputTokens = Math.max(0, totalInput - result.cacheReadTokens);
+	const totalOutput = typeof usage.completion_tokens === "number" ? usage.completion_tokens : 0;
 	result.reasoningTokens =
 		typeof completionDetails.reasoning_tokens === "number" ? completionDetails.reasoning_tokens : 0;
+	result.outputTokens = Math.max(0, totalOutput - result.reasoningTokens);
 	result.costUsd = calculateModelUsageCost(model, result);
 	return result;
+}
+
+interface StreamingToolCall {
+	id: string;
+	name: string;
+	arguments: string;
+}
+
+async function readChatCompletionStream(response: Response, options: AgentTurnOptions): Promise<AgentTurnResult> {
+	if (!response.body) throw new Error("OpenAI-compatible streaming response had no body");
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let buffer = "";
+	let text = "";
+	let reasoningContent = "";
+	let usage: unknown;
+	const calls = new Map<number, StreamingToolCall>();
+	const processBlock = (block: string): void => {
+		const data = block
+			.split("\n")
+			.filter(line => line.startsWith("data:"))
+			.map(line => line.slice(5).trimStart())
+			.join("\n");
+		if (!data || data === "[DONE]") return;
+		let payload: unknown;
+		try {
+			payload = JSON.parse(data);
+		} catch (error) {
+			throw new Error(`OpenAI-compatible stream returned malformed JSON: ${data.slice(0, 300)}`, {
+				cause: error,
+			});
+		}
+		if (!isRecord(payload)) return;
+		if (payload.usage !== undefined) usage = payload.usage;
+		if (!Array.isArray(payload.choices)) return;
+		for (const rawChoice of payload.choices) {
+			if (!isRecord(rawChoice) || !isRecord(rawChoice.delta)) continue;
+			const delta = rawChoice.delta;
+			const content = textFromContent(delta.content);
+			if (content) {
+				text += content;
+				options.onTextDelta?.(content);
+			}
+			if (typeof delta.reasoning_content === "string") reasoningContent += delta.reasoning_content;
+			if (!Array.isArray(delta.tool_calls)) continue;
+			for (const rawCall of delta.tool_calls) {
+				if (!isRecord(rawCall)) continue;
+				const index = typeof rawCall.index === "number" ? rawCall.index : calls.size;
+				const existing = calls.get(index) ?? { id: "", name: "", arguments: "" };
+				if (typeof rawCall.id === "string") existing.id = rawCall.id;
+				if (isRecord(rawCall.function)) {
+					if (typeof rawCall.function.name === "string") existing.name += rawCall.function.name;
+					if (typeof rawCall.function.arguments === "string") existing.arguments += rawCall.function.arguments;
+				}
+				calls.set(index, existing);
+			}
+		}
+	};
+	try {
+		while (true) {
+			if (options.signal.aborted) throw options.signal.reason ?? new Error("Request aborted");
+			const { done, value } = await reader.read();
+			buffer += decoder.decode(value, { stream: !done }).replaceAll("\r\n", "\n");
+			let boundary = buffer.indexOf("\n\n");
+			while (boundary !== -1) {
+				processBlock(buffer.slice(0, boundary));
+				buffer = buffer.slice(boundary + 2);
+				boundary = buffer.indexOf("\n\n");
+			}
+			if (done) break;
+		}
+		if (buffer.trim()) processBlock(buffer);
+	} finally {
+		reader.releaseLock();
+	}
+	const toolCalls: AgentFunctionCall[] = [...calls.entries()]
+		.sort(([left], [right]) => left - right)
+		.flatMap(([_index, call]) => {
+			if (!call.name) return [];
+			return [{ callId: call.id || crypto.randomUUID(), name: call.name, arguments: call.arguments }];
+		});
+	const output: Record<string, unknown>[] = [];
+	if (text || reasoningContent) {
+		output.push({
+			type: "message",
+			role: "assistant",
+			content: text ? [{ type: "output_text", text }] : [],
+			...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+		});
+	}
+	for (const call of toolCalls) {
+		output.push({ type: "function_call", call_id: call.callId, name: call.name, arguments: call.arguments });
+	}
+	return { output, text, toolCalls, usage: chatUsage(options.model, usage) };
 }
 
 async function runChatCompletions(options: AgentTurnOptions, apiKey: string | undefined): Promise<AgentTurnResult> {
@@ -101,6 +203,8 @@ async function runChatCompletions(options: AgentTurnOptions, apiKey: string | un
 			function: { name: tool.name, description: tool.description, parameters: toolJsonSchema(tool) },
 		})),
 		tool_choice: "auto",
+		stream: true,
+		...(/openai/i.test(options.model.provider) ? { stream_options: { include_usage: true } } : {}),
 		...(options.maxOutputTokens !== undefined
 			? { max_tokens: Math.min(options.maxOutputTokens, options.model.maxOutputTokens ?? Number.POSITIVE_INFINITY) }
 			: {}),
@@ -120,25 +224,27 @@ async function runChatCompletions(options: AgentTurnOptions, apiKey: string | un
 	}
 	if (options.serviceTier) body.service_tier = options.serviceTier;
 	const url = `${resolveModelBaseUrl(options.model)}/chat/completions`;
-	let response = await fetch(url, {
+	const requestSignal = createProviderAttemptSignal(options.signal);
+	const response = await fetch(url, {
 		method: "POST",
-		headers: compatibleHeaders(apiKey),
+		headers: compatibleHeaders(apiKey, options.sessionId),
 		body: JSON.stringify(body),
-		signal: options.signal,
+		signal: requestSignal,
 	});
-	for (let attempt = 0; attempt < 2 && (response.status === 429 || response.status >= 500); attempt += 1) {
-		await response.body?.cancel();
-		await Bun.sleep(500 * 2 ** attempt);
-		response = await fetch(url, {
-			method: "POST",
-			headers: compatibleHeaders(apiKey),
-			body: JSON.stringify(body),
-			signal: options.signal,
+	if (!response.ok) {
+		const retryAfterMs = retryAfterMilliseconds(response);
+		const text = (await response.text()).slice(0, MAX_ERROR_BODY);
+		const providerCode = providerErrorCode(text);
+		const message = `OpenAI-compatible request failed (${response.status} ${response.statusText}): ${text}`;
+		throw new ProviderHttpError(message, {
+			status: response.status,
+			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+			...(providerCode ? { providerCode } : {}),
+			hardQuota: isHardQuotaFailure(message, providerCode),
 		});
 	}
-	if (!response.ok) {
-		const text = (await response.text()).slice(0, MAX_ERROR_BODY);
-		throw new Error(`OpenAI-compatible request failed (${response.status} ${response.statusText}): ${text}`);
+	if (response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+		return await readChatCompletionStream(response, { ...options, signal: requestSignal });
 	}
 	const payload: unknown = await response.json();
 	if (!isRecord(payload) || !Array.isArray(payload.choices) || !isRecord(payload.choices[0])) {
@@ -184,7 +290,7 @@ export function createOpenAICompatibleProvider(model: Model): AgentTurnProvider 
 			return runResponsesTransport({
 				label: "OpenAI-compatible",
 				url: `${resolveModelBaseUrl(options.model)}/responses`,
-				headers: compatibleHeaders(apiKey),
+				headers: compatibleHeaders(apiKey, options.sessionId),
 				turn: options,
 			});
 		},

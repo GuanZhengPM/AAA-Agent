@@ -5,9 +5,14 @@ import {
 	type AgentTurnResult,
 	calculateModelUsageCost,
 	createEmptyUsageMetrics,
+	createProviderAttemptSignal,
+	isHardQuotaFailure,
 	isRecord,
 	type Model,
+	ProviderHttpError,
+	providerErrorCode,
 	resolveModelBaseUrl,
+	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
 import { toolJsonSchema } from "./responses-transport";
@@ -111,19 +116,24 @@ function anthropicUsage(model: Model, raw: unknown): UsageMetrics {
 }
 
 function requestBody(options: AgentTurnOptions): Record<string, unknown> {
+	const cacheable = options.model.family === "anthropic";
+	const tools: Record<string, unknown>[] = options.tools.map(tool => ({
+		name: tool.name,
+		description: tool.description,
+		input_schema: toolJsonSchema(tool),
+	}));
+	if (cacheable && tools.length > 0) tools[tools.length - 1]!.cache_control = { type: "ephemeral" };
 	const body: Record<string, unknown> = {
 		model: options.model.id,
 		max_tokens: Math.min(
 			options.model.maxOutputTokens ?? 16_000,
 			options.maxOutputTokens ?? Number.POSITIVE_INFINITY,
 		),
-		system: options.systemPrompt,
+		system: cacheable
+			? [{ type: "text", text: options.systemPrompt, cache_control: { type: "ephemeral" } }]
+			: options.systemPrompt,
 		messages: anthropicMessages(options),
-		tools: options.tools.map(tool => ({
-			name: tool.name,
-			description: tool.description,
-			input_schema: toolJsonSchema(tool),
-		})),
+		tools,
 		tool_choice: { type: "auto" },
 	};
 	if (options.model.effortFormat === "anthropic_thinking_toggle") {
@@ -151,7 +161,7 @@ async function runAnthropicTurn(options: AgentTurnOptions, apiKey: string): Prom
 			method: "POST",
 			headers: anthropicHeaders(options.model, apiKey, fastMode),
 			body: JSON.stringify(request),
-			signal: options.signal,
+			signal: createProviderAttemptSignal(options.signal),
 		});
 	let response = await send();
 	if (fastMode && (response.status === 400 || response.status === 429)) {
@@ -163,14 +173,17 @@ async function runAnthropicTurn(options: AgentTurnOptions, apiKey: string): Prom
 			response = await send();
 		}
 	}
-	for (let attempt = 0; attempt < 2 && (response.status === 429 || response.status >= 500); attempt += 1) {
-		await response.body?.cancel();
-		await Bun.sleep(500 * 2 ** attempt);
-		response = await send();
-	}
 	if (!response.ok) {
+		const retryAfterMs = retryAfterMilliseconds(response);
 		const text = (await response.text()).slice(0, MAX_ERROR_BODY);
-		throw new Error(`Anthropic Messages request failed (${response.status} ${response.statusText}): ${text}`);
+		const providerCode = providerErrorCode(text);
+		const message = `Anthropic Messages request failed (${response.status} ${response.statusText}): ${text}`;
+		throw new ProviderHttpError(message, {
+			status: response.status,
+			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+			...(providerCode ? { providerCode } : {}),
+			hardQuota: isHardQuotaFailure(message, providerCode),
+		});
 	}
 	const payload: unknown = await response.json();
 	if (!isRecord(payload) || !Array.isArray(payload.content)) {

@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import * as path from "node:path";
 import { createAdaptiveModelVariant } from "@aaa-agent/providers";
 import {
 	AdaptiveHarness,
@@ -13,18 +15,23 @@ import {
 	Effort,
 	type Effort as EffortType,
 	type EvidenceRef,
+	extractLedgerEntries,
 	inferTaskFeatures,
 	isRecord,
 	type LongRunCheckpoint,
 	type Model,
 	type ModelCapabilityRegistry,
+	mergeLedger,
 	type PrimaryExecutionContext,
+	pendingDeliverables,
+	resolveHistoryWorkingBudget,
 	runAgentSession,
 	type ServiceTier,
 	type StructuredContextState,
 	type SubagentResult,
 	type SubagentTask,
 	type ThinkingMode,
+	trimConversationKeepingPrefix,
 	type UsageMetrics,
 	type VerificationAssurance,
 	type VerificationResult,
@@ -45,6 +52,7 @@ import subagentSliceTemplate from "./prompts/subagent-slice.md" with { type: "te
 import subagentSystemPrompt from "./prompts/subagent-system.md" with { type: "text" };
 import verifierRequestTemplate from "./prompts/verifier-request.md" with { type: "text" };
 import verifierSystemTemplate from "./prompts/verifier-system.md" with { type: "text" };
+import { resolveDigestBudget } from "./session-store";
 
 export interface AdaptiveRuntimeAgentEvent {
 	phase: "primary" | "subagent" | "verifier";
@@ -59,6 +67,13 @@ export interface AdaptiveVerifierOptions {
 	serviceTier?: ServiceTier;
 }
 
+export interface AdaptiveSubagentOptions {
+	model: Model;
+	provider: AgentTurnProvider;
+	reasoningConfig: ThinkingMode;
+	serviceTier?: ServiceTier;
+}
+
 export interface RunAdaptiveTaskOptions {
 	task: string;
 	model: Model;
@@ -66,12 +81,16 @@ export interface RunAdaptiveTaskOptions {
 	cwd: string;
 	reasoningConfig: ThinkingMode;
 	serviceTier?: ServiceTier;
+	/** Stable parent session id for provider cache affinity. */
+	sessionId?: string;
 	approveShell?: (request: ShellApprovalRequest) => boolean | Promise<boolean>;
 	capabilities: ModelCapabilityRegistry;
 	overlays: AdaptiveOverlayRegistry;
 	conversation?: readonly AgentConversationMessage[];
 	contextState?: StructuredContextState;
 	verifier?: AdaptiveVerifierOptions;
+	/** Optional cheaper/faster model for read-only delegated work. */
+	subagent?: AdaptiveSubagentOptions;
 	additionalTools?: readonly AgentTool[];
 	checkpoint?: LongRunCheckpoint;
 	onCheckpoint?: (checkpoint: LongRunCheckpoint) => void | Promise<void>;
@@ -81,8 +100,15 @@ export interface RunAdaptiveTaskOptions {
 	onAgentEvent?: (event: AdaptiveRuntimeAgentEvent) => void;
 }
 
+const compiledTemplates = new Map<string, Handlebars.TemplateDelegate>();
+
 function render(template: string, values: object): string {
-	return Handlebars.compile(template, { noEscape: true })(values);
+	let compiled = compiledTemplates.get(template);
+	if (!compiled) {
+		compiled = Handlebars.compile(template, { noEscape: true });
+		compiledTemplates.set(template, compiled);
+	}
+	return compiled(values);
 }
 
 interface StartedToolObservation {
@@ -90,8 +116,46 @@ interface StartedToolObservation {
 	arguments: unknown;
 }
 
+interface ObservedAcceptance {
+	command: string;
+	evidence: EvidenceRef;
+	mutationEpoch: number;
+}
+
 const MAX_PRIMARY_RUNTIME_EVIDENCE = 32;
 const CHECK_COMMAND_PATTERN = /\b(?:test|check|lint|build|pytest)\b/i;
+
+function shellSyntaxWithoutHeredocBodies(command: string): string {
+	let syntax = "";
+	let cursor = 0;
+	const start = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n/g;
+	for (let match = start.exec(command); match; match = start.exec(command)) {
+		syntax += command.slice(cursor, start.lastIndex);
+		const delimiter = match[2];
+		if (!delimiter) break;
+		const end = new RegExp(`^\\s*${delimiter}\\s*$`, "m");
+		const tail = command.slice(start.lastIndex);
+		const terminator = end.exec(tail);
+		if (!terminator || terminator.index === undefined) {
+			cursor = command.length;
+			break;
+		}
+		cursor = start.lastIndex + terminator.index + terminator[0].length;
+		start.lastIndex = cursor;
+	}
+	return `${syntax}${command.slice(cursor)}`;
+}
+
+function isObservedAcceptanceChain(command: string): boolean {
+	// Overall rc=0 proves every command in a pure && chain passed. Ignore Python
+	// heredoc bodies when inspecting shell control operators, but retain syntax
+	// after the delimiter so `pytest || true` and later masking still fail shut.
+	const shellSyntax = shellSyntaxWithoutHeredocBodies(command);
+	if (/[|;&]/.test(shellSyntax.replaceAll("&&", ""))) return false;
+	return shellSyntax
+		.split("&&")
+		.some(segment => defineVerificationCheck("observed-check", segment.trim()) !== undefined);
+}
 
 interface TokenReservation {
 	limit: number;
@@ -126,7 +190,7 @@ function createRuntimeToolEvidence(
 	event: Extract<AgentSessionEvent, { type: "tool_completed" }>,
 	started: StartedToolObservation | undefined,
 ): EvidenceRef | undefined {
-	if (!event.success || !started) return undefined;
+	if (!started) return undefined;
 	const argumentsValue = isRecord(started.arguments) ? started.arguments : {};
 	const targetKeys =
 		started.name === "shell"
@@ -137,21 +201,27 @@ function createRuntimeToolEvidence(
 	const target = targetKeys
 		.map(key => argumentsValue[key])
 		.find((value): value is string => typeof value === "string");
+	const isTestObservation =
+		started.name === "check" || (started.name === "shell" && Boolean(target && CHECK_COMMAND_PATTERN.test(target)));
+	// A failed deterministic check can be exactly the expected outcome. Keep
+	// its host-observed rc/output as evidence, but never mark it as a passing
+	// acceptance check. Other failed tools remain non-evidence.
+	if (!event.success && !isTestObservation) return undefined;
 	const exitCode = event.details?.exitCode;
 	const summary = [
-		`Host completed ${started.name} successfully`,
+		event.success ? `Host completed ${started.name} successfully` : `Host observed ${started.name} failure`,
 		target ? `target=${target.slice(0, 1_200)}` : undefined,
 		typeof exitCode === "number" ? `exitCode=${exitCode}` : undefined,
+		!event.success && event.error ? `output=${event.error.slice(0, 1_000)}` : undefined,
 	]
 		.filter((value): value is string => value !== undefined)
 		.join("; ");
 	return {
-		kind:
-			started.name === "check" || (started.name === "shell" && target && CHECK_COMMAND_PATTERN.test(target))
-				? "test"
-				: started.name === "read" || started.name === "write" || started.name === "edit"
-					? "file"
-					: "tool",
+		kind: isTestObservation
+			? "test"
+			: started.name === "read" || started.name === "write" || started.name === "edit"
+				? "file"
+				: "tool",
 		ref: `${started.name}:${event.callId}`,
 		summary,
 	};
@@ -304,15 +374,145 @@ function parseVerifierResult(
 	}
 }
 
+interface CapturedCommandResult {
+	exitCode: number | null;
+	output: string;
+	timedOut: boolean;
+}
+
+function bindVerifierClaimsToHost(
+	verdict: VerificationResult,
+	trustedEvidence: readonly EvidenceRef[],
+): VerificationResult {
+	if (trustedEvidence.length === 0) return verdict;
+	const trusted = trustedEvidence.map(item => structuredClone(item));
+	const bind = (claim: EvidenceRef): EvidenceRef | undefined =>
+		trusted.find(item => item.kind === claim.kind && item.ref === claim.ref) ??
+		trusted.find(
+			item =>
+				item.kind === claim.kind &&
+				(Boolean(item.summary?.includes(claim.ref)) || Boolean(claim.summary?.includes(item.ref))),
+		) ??
+		trusted.find(item => item.kind === claim.kind);
+	return {
+		...verdict,
+		// A passing semantic verdict is supported by every successful host action
+		// the verifier actually performed; opaque/path refs from model JSON never
+		// cross the trust boundary unchanged.
+		evidence: verdict.passed ? trusted : (verdict.evidence ?? []).flatMap(item => bind(item) ?? []),
+		goalEvidence: verdict.goalEvidence?.flatMap(item => {
+			const evidence = bind(item.evidence);
+			return evidence ? [{ ...item, evidence }] : [];
+		}),
+		verifiedFacts: verdict.verifiedFacts?.flatMap(item => {
+			const evidence = item.evidence.flatMap(claim => bind(claim) ?? []);
+			return evidence.length > 0 ? [{ ...item, evidence }] : [];
+		}),
+		findings: verdict.findings?.map(item => ({
+			...item,
+			evidence: item.evidence.flatMap(claim => bind(claim) ?? []),
+		})),
+	};
+}
+
+async function readBoundedStream(stream: ReadableStream<Uint8Array>, maximum = 12_000): Promise<string> {
+	const reader = stream.getReader();
+	const decoder = new TextDecoder();
+	const headLimit = Math.ceil(maximum * 0.6);
+	const tailLimit = maximum - headLimit;
+	let head = "";
+	let tail = "";
+	let complete: string | undefined = "";
+	let total = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const text = decoder.decode(value, { stream: true });
+			total += text.length;
+			if (complete !== undefined) {
+				complete += text;
+				if (complete.length > maximum) complete = undefined;
+			}
+			if (head.length < headLimit) head += text.slice(0, headLimit - head.length);
+			tail = `${tail}${text}`.slice(-tailLimit);
+		}
+		const flush = decoder.decode();
+		if (flush) {
+			total += flush.length;
+			if (complete !== undefined) {
+				complete += flush;
+				if (complete.length > maximum) complete = undefined;
+			}
+			if (head.length < headLimit) head += flush.slice(0, headLimit - head.length);
+			tail = `${tail}${flush}`.slice(-tailLimit);
+		}
+	} finally {
+		reader.releaseLock();
+	}
+	if (complete !== undefined) return complete;
+	return `${head}\n… ${total - head.length - tail.length} characters omitted …\n${tail}`;
+}
+
+async function execCapture(command: string, cwd: string, timeoutMs = 180_000): Promise<CapturedCommandResult> {
+	// Re-runs a command the PRIMARY already executed in this session. Drain both
+	// pipes concurrently (avoids child-process backpressure deadlocks) and retain
+	// bounded failure output so recovery does not need to execute it again.
+	try {
+		const child = Bun.spawn(["/bin/bash", "-c", command], {
+			cwd,
+			stdout: "pipe",
+			stderr: "pipe",
+			stdin: "ignore",
+		});
+		let timedOut = false;
+		const timer = setTimeout(() => {
+			timedOut = true;
+			try {
+				child.kill(9);
+			} catch {}
+		}, timeoutMs);
+		const [code, stdout, stderr] = await Promise.all([
+			child.exited,
+			readBoundedStream(child.stdout),
+			readBoundedStream(child.stderr),
+		]);
+		clearTimeout(timer);
+		return {
+			exitCode: timedOut ? null : typeof code === "number" ? code : null,
+			output: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n"),
+			timedOut,
+		};
+	} catch (error) {
+		return {
+			exitCode: null,
+			output: error instanceof Error ? error.message : String(error),
+			timedOut: false,
+		};
+	}
+}
+
+const ACCEPTANCE_HINT_PATTERN = /(selfcheck|unittest|pytest|\btest\b|check|verify)/i;
+const MAX_SUBAGENT_FINDING_CHARACTERS = 6_000;
+
+function compactFinding(text: string, maximum = MAX_SUBAGENT_FINDING_CHARACTERS): string {
+	if (text.length <= maximum) return text;
+	const marker = `\n… ${text.length - maximum} characters omitted from delegated finding …\n`;
+	const available = Math.max(0, maximum - marker.length);
+	const head = Math.ceil(available * 0.7);
+	return `${text.slice(0, head)}${marker}${text.slice(text.length - (available - head))}`;
+}
+
 function deriveSubagentTasks(task: string): SubagentTask[] {
 	const slices = task
 		.split("\n")
 		.map(line => line.match(/^\s*(?:[-*]|\d+[.)])\s+(.+)$/)?.[1]?.trim())
 		.filter((value): value is string => Boolean(value));
+	const delegatedContext = compactFinding(task, 12_000);
 	if (slices.length >= 2) {
 		return slices.slice(0, 4).map((slice, index) => ({
 			id: `slice-${index + 1}`,
-			prompt: render(subagentSliceTemplate, { task, slice }),
+			prompt: render(subagentSliceTemplate, { task: delegatedContext, slice }),
 			mode: "read",
 			origin: "user",
 			estimatedTokens: 4_000,
@@ -321,24 +521,29 @@ function deriveSubagentTasks(task: string): SubagentTask[] {
 	return [
 		{
 			id: "discovery",
-			prompt: render(subagentDiscoveryTemplate, { task }),
+			prompt: render(subagentDiscoveryTemplate, { task: delegatedContext }),
 			mode: "read",
 			origin: "user",
 			estimatedTokens: 5_000,
 		},
 		{
 			id: "risk-review",
-			prompt: render(subagentRiskTemplate, { task }),
+			prompt: render(subagentRiskTemplate, { task: delegatedContext }),
 			mode: "read",
 			origin: "user",
 			estimatedTokens: 5_000,
 		},
 	];
 }
-function resolveSubagentEffort(context: Pick<PrimaryExecutionContext, "model" | "profile">): EffortType {
+function resolveSubagentEffort(
+	context: Pick<PrimaryExecutionContext, "profile">,
+	model: Model,
+	mode: ThinkingMode,
+): EffortType {
+	if (mode !== "auto" && mode !== "off" && model.efforts.includes(mode)) return mode;
 	const preferred = context.profile.planningHorizon < 0.5 ? Effort.Medium : Effort.Low;
-	if (context.model.efforts.includes(preferred)) return preferred;
-	return context.model.efforts[0] ?? Effort.Minimal;
+	if (model.efforts.includes(preferred)) return preferred;
+	return model.efforts[0] ?? Effort.Minimal;
 }
 
 function resolveVerifierEffort(model: Model, mode: ThinkingMode, fallback: EffortType): EffortType {
@@ -359,6 +564,30 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 		);
 	}
 	const variant = createAdaptiveModelVariant(options.model, options.reasoningConfig, options.serviceTier);
+	const priorLedger = options.contextState?.ledger ?? [];
+	const taskTurn = Math.max(0, ...priorLedger.map(entry => entry.turn)) + 1;
+	const effectiveLedger = mergeLedger(priorLedger, extractLedgerEntries(options.task, taskTurn));
+	const effectiveContextState: StructuredContextState | undefined = options.contextState
+		? { ...structuredClone(options.contextState), ledger: effectiveLedger }
+		: effectiveLedger.length > 0
+			? {
+					version: 1,
+					userGoals: [],
+					completedGoals: [],
+					remainingGoals: [],
+					verifiedFacts: [],
+					artifacts: [],
+					openRisks: [],
+					ledger: effectiveLedger,
+					updatedAt: Date.now(),
+				}
+			: undefined;
+	const subagent = options.subagent ?? {
+		model: options.model,
+		provider: options.provider,
+		reasoningConfig: options.reasoningConfig,
+		...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+	};
 	const verifier = options.verifier ?? {
 		model: options.model,
 		provider: options.provider,
@@ -374,6 +603,9 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 	const primaryAllTools = [...toolset.allTools, ...additionalTools];
 	const signal = options.signal ?? new AbortController().signal;
 	const verificationChecks = new Map<string, VerificationCheck>();
+	const observedAcceptances: ObservedAcceptance[] = [];
+	const affinityRoot = options.sessionId ?? crypto.randomUUID();
+	let globalMutationEpoch = 0;
 	let nextVerificationCheckId = 1;
 	let tokenBudget: SharedTokenBudget | undefined;
 	const resolveTokenBudget = (total: number): SharedTokenBudget => {
@@ -388,15 +620,15 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 			const budget = resolveTokenBudget(context.budget.totalMaxTokens);
 			const reservation = budget.reserve(context.budget.subagentMaxTokens, `Subagent ${task.id}`);
 			const session = await runAgentSession({
-				model: options.model,
-				provider: options.provider,
+				model: subagent.model,
+				provider: subagent.provider,
 				cwd: options.cwd,
 				systemPrompt: subagentSystemPrompt,
 				userPrompt: task.prompt,
 				tools: toolset.readonlyTools,
 				policy: {
-					...(options.reasoningConfig === "off" ? { disableReasoning: true } : {}),
-					reasoningEffort: resolveSubagentEffort(context),
+					...(subagent.reasoningConfig === "off" ? { disableReasoning: true } : {}),
+					reasoningEffort: resolveSubagentEffort(context, subagent.model, subagent.reasoningConfig),
 					toolBudget: 8,
 					maxTurns: context.budget.subagentMaxTurns,
 					maxToolCalls: Math.max(8, context.budget.subagentMaxTurns * 2),
@@ -404,25 +636,28 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 					maxRepeatedToolCalls: 2,
 					maxConsecutiveToolFailures: 2,
 				},
-				...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+				...(subagent.serviceTier ? { serviceTier: subagent.serviceTier } : {}),
+				sessionId: `${affinityRoot}:subagent:${task.id}`,
 				signal: context.signal,
 				onEvent: event => options.onAgentEvent?.({ phase: "subagent", subagentId: task.id, event }),
 			});
 			budget.settle(reservation, session.usage);
+			const finding = compactFinding(session.output);
 			return {
 				taskId: task.id,
 				status: session.success ? "succeeded" : "failed",
-				findings: session.output
+				findings: finding
 					? [
 							{
-								summary: session.output,
-								evidence: [{ kind: "subagent", ref: task.id, summary: session.output.slice(0, 500) }],
+								summary: finding,
+								evidence: [{ kind: "subagent", ref: task.id, summary: finding.slice(0, 500) }],
 								confidence: session.success ? 0.75 : 0.25,
 							},
 						]
 					: [],
-				unresolved: session.success ? [] : [session.error ?? task.prompt],
+				unresolved: session.success ? [] : [compactFinding(session.error ?? task.prompt, 2_000)],
 				usage: session.usage,
+				diagnostics: session.diagnostics,
 			};
 		},
 		executor: {
@@ -432,13 +667,68 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 				}
 				const startedTools = new Map<string, StartedToolObservation>();
 				const runtimeEvidence: EvidenceRef[] = [];
-				let mutationEpoch = 0;
 				const budget = resolveTokenBudget(context.policy.maxTotalTokens);
 				const primarySessionLimit =
 					context.policy.verification === "none"
 						? context.policy.maxTotalTokens
-						: Math.floor(context.policy.maxTotalTokens * 0.8);
+						: Math.floor(context.policy.maxTotalTokens * 0.85);
 				const reservation = budget.reserve(primarySessionLimit, `Primary round ${context.round}`);
+				let cachedGateFailure: { mutationEpoch: number; command: string; feedback: string } | undefined;
+				const beforeFinalize = async (candidate: {
+					workspaceMutated: boolean;
+				}): Promise<{ accepted: boolean; feedback?: string }> => {
+					const notes: string[] = [];
+					const missing = pendingDeliverables(effectiveLedger, subject =>
+						existsSync(path.join(options.cwd, subject)),
+					);
+					if (missing.length > 0) {
+						notes.push(`Missing requested deliverable(s): ${missing.map(item => item.subject).join(", ")}.`);
+					}
+					const acceptanceCommands = [...verificationChecks.keys()].filter(
+						command => CHECK_COMMAND_PATTERN.test(command) || ACCEPTANCE_HINT_PATTERN.test(command),
+					);
+					const hasFreshPass = [...verificationChecks.values()].some(
+						check => check.current && check.primaryExitCode === 0 && check.mutationEpoch === globalMutationEpoch,
+					);
+					if (candidate.workspaceMutated && acceptanceCommands.length > 0 && !hasFreshPass) {
+						const command =
+							acceptanceCommands.find(item => ACCEPTANCE_HINT_PATTERN.test(item)) ?? acceptanceCommands[0];
+						if (
+							cachedGateFailure?.mutationEpoch === globalMutationEpoch &&
+							cachedGateFailure.command === command
+						) {
+							notes.push(cachedGateFailure.feedback);
+						} else {
+							const capture = await execCapture(command, options.cwd);
+							const existing = verificationChecks.get(command);
+							if (capture.exitCode === 0 && existing) {
+								verificationChecks.set(command, {
+									...existing,
+									primaryExitCode: 0,
+									current: true,
+									mutationEpoch: globalMutationEpoch,
+								});
+								runtimeEvidence.push({
+									kind: "test",
+									ref: `host-finalize:${existing.id}:${globalMutationEpoch}`,
+									summary: `Host re-ran current acceptance; target=${command}; exitCode=0`,
+								});
+								cachedGateFailure = undefined;
+							} else {
+								const feedback = [
+									`Acceptance command failed: ${command}`,
+									`exitCode=${capture.exitCode ?? (capture.timedOut ? "timeout" : "unknown")}`,
+									capture.output ? `Output:\n${capture.output}` : undefined,
+								]
+									.filter((item): item is string => Boolean(item))
+									.join("\n");
+								cachedGateFailure = { mutationEpoch: globalMutationEpoch, command, feedback };
+								notes.push(feedback);
+							}
+						}
+					}
+					return notes.length > 0 ? { accepted: false, feedback: notes.join("\n\n") } : { accepted: true };
+				};
 				const session = await runAgentSession({
 					model: options.model,
 					provider: options.provider,
@@ -468,15 +758,29 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						maxConsecutiveToolFailures: context.policy.maxConsecutiveToolFailures,
 					},
 					...(options.serviceTier ? { serviceTier: options.serviceTier } : {}),
+					sessionId: `${affinityRoot}:primary`,
 					signal: context.signal,
-					history: context.round === 1 && !options.checkpoint ? options.conversation : undefined,
+					beforeFinalize,
+					history:
+						context.round === 1
+							? trimConversationKeepingPrefix(
+									options.conversation ?? [],
+									Math.min(
+										resolveDigestBudget(options.model.contextWindow).trigger,
+										resolveHistoryWorkingBudget(options.model.contextWindow, context.task.length).trigger,
+									),
+								)
+							: undefined,
 					onEvent: event => {
 						if (event.type === "tool_started") {
 							startedTools.set(event.callId, { name: event.name, arguments: event.arguments });
 						} else if (event.type === "tool_completed") {
 							const started = startedTools.get(event.callId);
-							if (event.success && (started?.name === "write" || started?.name === "edit")) {
-								mutationEpoch += 1;
+							const mutatedWorkspace =
+								(event.success && (started?.name === "write" || started?.name === "edit")) ||
+								(started?.name === "shell" && event.details?.workspaceMutationRisk !== "none");
+							if (mutatedWorkspace) {
+								globalMutationEpoch += 1;
 								for (const [command, check] of verificationChecks) {
 									verificationChecks.set(command, { ...check, current: false });
 								}
@@ -494,19 +798,35 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 									command,
 								);
 								const exitCode = event.details?.exitCode;
-								if (check && exitCode === 0) {
+								if (check && typeof exitCode === "number") {
 									verificationChecks.set(command, {
 										...check,
 										discoveredRound: context.round,
 										primaryExitCode: exitCode,
-										current: true,
-										mutationEpoch,
+										current: exitCode === 0,
+										mutationEpoch: globalMutationEpoch,
 									});
 									if (!existing) nextVerificationCheckId += 1;
 								}
 							}
 							const evidence = createRuntimeToolEvidence(event, startedTools.get(event.callId));
-							if (evidence) runtimeEvidence.push(evidence);
+							if (evidence) {
+								runtimeEvidence.push(evidence);
+								if (
+									event.success &&
+									started?.name === "shell" &&
+									isRecord(started.arguments) &&
+									typeof started.arguments.command === "string" &&
+									isObservedAcceptanceChain(started.arguments.command)
+								) {
+									observedAcceptances.push({
+										command: started.arguments.command,
+										evidence,
+										mutationEpoch: globalMutationEpoch,
+									});
+									if (observedAcceptances.length > MAX_PRIMARY_RUNTIME_EVIDENCE) observedAcceptances.shift();
+								}
+							}
 							startedTools.delete(event.callId);
 						}
 						options.onAgentEvent?.({ phase: "primary", event });
@@ -527,13 +847,73 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 			verify: async (context, result) => {
 				const checks = [...verificationChecks.values()];
 				const currentChecks = checks.filter(check => check.current && check.primaryExitCode === 0);
-				const deterministicEvidence = (result.evidence ?? []).filter(
-					evidence =>
-						evidence.kind === "test" &&
-						currentChecks.some(check => evidence.summary?.includes(`target=${check.command}`)),
+				const currentObserved = observedAcceptances.filter(item => item.mutationEpoch === globalMutationEpoch);
+				const deterministicEvidence = [
+					...(result.evidence ?? []).filter(
+						evidence =>
+							evidence.kind === "test" &&
+							currentChecks.some(check => evidence.summary?.includes(`target=${check.command}`)),
+					),
+					...currentObserved.map(item => item.evidence),
+				].filter((evidence, index, all) => all.findIndex(item => item.ref === evidence.ref) === index);
+				const recordedAcceptance = checks
+					.map(check => check.command)
+					.filter(command => CHECK_COMMAND_PATTERN.test(command) || ACCEPTANCE_HINT_PATTERN.test(command));
+				let acceptanceRerunNote: string | undefined;
+				let acceptanceRerunFresh = false;
+				const staleWithoutProbe =
+					result.workspaceMutated &&
+					recordedAcceptance.length > 0 &&
+					!checks.some(
+						check => check.current && check.primaryExitCode === 0 && check.mutationEpoch === globalMutationEpoch,
+					);
+				if (staleWithoutProbe) {
+					const probeTarget =
+						recordedAcceptance.find(command => ACCEPTANCE_HINT_PATTERN.test(command)) ?? recordedAcceptance[0];
+					const rerun = await execCapture(probeTarget, options.cwd);
+					if (rerun.exitCode === 0) {
+						acceptanceRerunFresh = true;
+						acceptanceRerunNote = `host re-ran \`${probeTarget}\` after final mutation: exit 0`;
+					} else {
+						acceptanceRerunNote = [
+							`host re-ran \`${probeTarget}\` after final mutation: exit ${rerun.exitCode ?? (rerun.timedOut ? "timeout" : "unknown")}`,
+							rerun.output ? `output: ${rerun.output}` : undefined,
+						]
+							.filter((item): item is string => Boolean(item))
+							.join("; ");
+					}
+				}
+				const staleAcceptanceRisk = staleWithoutProbe && !acceptanceRerunFresh;
+				const missingDeliverableList = pendingDeliverables(effectiveLedger, subject =>
+					existsSync(`${options.cwd}/${subject}`),
 				);
-				if (context.policy.verification === "targeted" && deterministicEvidence.length > 0) {
+				const gateVerdict = async <T extends { passed: boolean; summary: string; unmetCriteria?: string[] }>(
+					verdict: T,
+				): Promise<T> => {
+					if (
+						!verdict.passed ||
+						(missingDeliverableList.length === 0 && !staleAcceptanceRisk && !acceptanceRerunNote)
+					)
+						return verdict;
+					const notes: string[] = [];
+					if (acceptanceRerunNote) notes.push(acceptanceRerunNote);
+					if (staleAcceptanceRisk) {
+						notes.push("workspace was mutated after the last successful acceptance command");
+					}
+					if (missingDeliverableList.length > 0) {
+						notes.push(
+							`requested deliverable(s) not on disk: ${missingDeliverableList.map(d => d.subject).join(", ")}`,
+						);
+					}
 					return {
+						...verdict,
+						passed: false,
+						summary: `${verdict.summary}; host gate: ${notes.join("; ")}`,
+						unmetCriteria: [...(verdict.unmetCriteria ?? []), ...notes],
+					};
+				};
+				if (context.policy.verification === "targeted" && deterministicEvidence.length > 0) {
+					const shortCircuit: VerificationResult = {
 						passed: true,
 						summary: "Accepted current deterministic host check.",
 						usage: createEmptyUsageMetrics(),
@@ -541,6 +921,7 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						hostEvidence: deterministicEvidence,
 						evidence: deterministicEvidence,
 					};
+					return await gateVerdict(shortCircuit);
 				}
 				const startedTools = new Map<string, StartedToolObservation>();
 				const hostEvidence: EvidenceRef[] = [];
@@ -555,8 +936,8 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 					cwd: options.cwd,
 					systemPrompt: render(verifierSystemTemplate, { platform: process.platform }),
 					userPrompt: render(verifierRequestTemplate, {
-						task: context.task,
-						output: result.output,
+						task: compactFinding(context.task, 32_000),
+						output: compactFinding(result.output, 8_000),
 						goals: context.goals,
 						round: context.round,
 						evidence: result.evidence ?? [],
@@ -581,6 +962,7 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						maxConsecutiveToolFailures: context.policy.maxConsecutiveToolFailures,
 					},
 					...(verifier.serviceTier ? { serviceTier: verifier.serviceTier } : {}),
+					sessionId: `${affinityRoot}:verifier`,
 					signal: context.signal,
 					onEvent: event => {
 						if (event.type === "tool_started") {
@@ -600,22 +982,27 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						failureKind: "infrastructure",
 						summary: session.error ?? "Verifier failed to complete.",
 						usage: session.usage,
+						diagnostics: session.diagnostics,
 						assurance: verificationAssurance,
 						hostEvidence,
 					};
 				}
-				return parseVerifierResult(session.output, session.usage, verificationAssurance, hostEvidence);
+				const parsed = parseVerifierResult(session.output, session.usage, verificationAssurance, hostEvidence);
+				const bound = bindVerifierClaimsToHost(parsed, [...(result.evidence ?? []), ...hostEvidence]);
+				return await gateVerdict({ ...bound, diagnostics: session.diagnostics });
 			},
 		},
 	});
 
-	const features = inferTaskFeatures(options.task);
+	const features = inferTaskFeatures(options.task, {
+		contextTokens: Math.ceil(options.task.length / 1.5),
+	});
 	const subagentTasks = features.userRequestedParallel ? deriveSubagentTasks(options.task) : undefined;
 	const result = await harness.run({
 		task: options.task,
 		model: variant,
 		subagentTasks,
-		contextState: options.contextState,
+		contextState: effectiveContextState,
 		checkpoint: options.checkpoint,
 		onCheckpoint: options.onCheckpoint,
 		adaptive: options.adaptive,

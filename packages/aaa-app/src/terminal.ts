@@ -161,6 +161,18 @@ export class TaskTerminalReporter {
 			if (event.delta.trim()) this.#textSeen = true;
 			return;
 		}
+		if (event.type === "completion_rejected") {
+			this.#endAssistantSegment();
+			this.#status(`gate › ${clamp(event.feedback, 180)} · continuing in the same round`);
+			return;
+		}
+		if (event.type === "provider_retry") {
+			this.#endAssistantSegment();
+			this.#status(
+				`provider › retry ${event.attempt} in ${formatDuration(event.delayMs)} — ${clamp(event.error, 120)}`,
+			);
+			return;
+		}
 		if (event.type === "policy_escalated") {
 			this.#endAssistantSegment();
 			this.#status(`policy › ${event.reason} · ${event.toolCount} tools available`);
@@ -214,12 +226,21 @@ export class TaskTerminalReporter {
 			this.#output.write(`${prefix}${result.output.trim()}\n`);
 		}
 		const elapsed = formatDuration(result.metrics.completedAt - result.metrics.startedAt);
-		const tokens = result.metrics.inputTokens + result.metrics.outputTokens;
+		const activeTokens =
+			result.metrics.inputTokens +
+			result.metrics.outputTokens +
+			result.metrics.reasoningTokens +
+			result.metrics.cacheWriteTokens;
+		const cache = result.metrics.cacheReadTokens ? ` · ${formatTokens(result.metrics.cacheReadTokens)} cache` : "";
+		const reasoning = result.metrics.reasoningTokens
+			? ` · ${formatTokens(result.metrics.reasoningTokens)} reasoning`
+			: "";
+		const retries = result.metrics.providerRetries ? ` · ${result.metrics.providerRetries} retries` : "";
 		const verification = result.verification
 			? ` · ${result.verification.passed ? "verified" : "verification failed"}`
 			: "";
 		const recovery = result.metrics.recoveryRounds ? ` · ${result.metrics.recoveryRounds} recovery` : "";
-		const summary = `${result.success ? "✓ completed" : "✗ failed"} · ${result.lane}${verification}${recovery} · ${result.metrics.toolCalls} tools · ${elapsed} · ${formatTokens(tokens)} tokens`;
+		const summary = `${result.success ? "✓ completed" : "✗ failed"} · ${result.lane}${verification}${recovery} · ${result.metrics.toolCalls} tools · ${elapsed} · ${formatTokens(activeTokens)} active${cache}${reasoning}${retries}`;
 		this.#statusOutput.write(`${this.#style(summary, result.success ? ANSI.green : ANSI.red)}\n`);
 	}
 }

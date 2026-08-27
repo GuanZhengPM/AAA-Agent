@@ -375,6 +375,7 @@ const configuredModelSchema = z.object({
 		.optional(),
 	apiKeyHeader: z.enum(["bearer", "x-api-key"]).optional(),
 	maxOutputTokens: z.number().int().positive().optional(),
+	maxConcurrentRequests: z.number().int().positive().optional(),
 	apiKeyEnv: z.string().min(1).optional(),
 	family: z.string().min(1).optional(),
 	pricing: z
@@ -438,6 +439,7 @@ async function loadConfiguredModels(): Promise<Model[]> {
 			authChannel: model.authChannel ?? "api_key",
 			...(model.effortFormat ? { effortFormat: model.effortFormat } : {}),
 			...(model.maxOutputTokens ? { maxOutputTokens: model.maxOutputTokens } : {}),
+			...(model.maxConcurrentRequests ? { maxConcurrentRequests: model.maxConcurrentRequests } : {}),
 			servicePlan: model.servicePlan ?? (model.authChannel === "local" ? "local" : "payg"),
 			...(model.baseUrlEnv ? { baseUrlEnv: model.baseUrlEnv } : {}),
 			...(model.apiKeyEnv ? { apiKeyEnv: model.apiKeyEnv } : {}),

@@ -1,3 +1,5 @@
+import type { LedgerEntry } from "./conversation-ledger";
+
 export const THINKING_EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof THINKING_EFFORTS)[number];
 export const Effort = {
@@ -49,6 +51,8 @@ export interface Model {
 	effortFormat?: EffortFormat;
 	apiKeyHeader?: ApiKeyHeader;
 	maxOutputTokens?: number;
+	/** Per-account request concurrency; rate-sensitive providers such as GLM use 1. */
+	maxConcurrentRequests?: number;
 	apiKeyEnv?: string;
 	family?: string;
 	pricing?: ModelPricing;
@@ -274,6 +278,8 @@ export interface StructuredContextState {
 	verifiedFacts: VerifiedFact[];
 	artifacts: EvidenceRef[];
 	openRisks: string[];
+	/** Host-extracted durable conventions, corrections and requested deliverables. */
+	ledger?: LedgerEntry[];
 	recoveryGuidance?: string;
 	updatedAt: number;
 }
@@ -347,6 +353,7 @@ export interface SubagentResult {
 	unresolved: string[];
 	recommendedNextAction?: string;
 	usage: UsageMetrics;
+	diagnostics?: AgentRunDiagnostics;
 	sufficient?: boolean;
 	error?: string;
 }
@@ -366,7 +373,9 @@ export interface SubagentBatchResult {
 }
 
 export interface UsageMetrics {
+	/** Uncached input tokens; cache reads/writes are always separate fields. */
 	inputTokens: number;
+	/** Visible/non-reasoning output tokens; reasoning tokens are separate. */
 	outputTokens: number;
 	cacheReadTokens: number;
 	cacheWriteTokens: number;
@@ -380,6 +389,17 @@ export interface ToolRunDiagnostics {
 }
 
 export interface AgentRunDiagnostics {
+	/** Epoch timestamps and phase timings for latency attribution. */
+	startedAt?: number;
+	firstTokenAt?: number;
+	firstActionAt?: number;
+	providerRequests?: number;
+	providerRetries?: number;
+	providerLatencyMs?: number;
+	providerWaitMs?: number;
+	toolLatencyMs?: number;
+	contextCompactions?: number;
+	estimatedCharactersPerToken?: number;
 	toolArgumentFailures: number;
 	unknownToolCalls: number;
 	toolExecutionFailures: number;
@@ -393,6 +413,12 @@ export interface AgentRunDiagnostics {
 
 export interface HarnessRunMetrics extends UsageMetrics {
 	startedAt: number;
+	providerRequests?: number;
+	providerRetries?: number;
+	providerLatencyMs?: number;
+	providerWaitMs?: number;
+	toolLatencyMs?: number;
+	contextCompactions?: number;
 	completedAt: number;
 	timeToFirstActionMs?: number;
 	timeToFirstUsefulResultMs?: number;
@@ -452,6 +478,7 @@ export interface VerificationResult {
 	passed: boolean;
 	summary: string;
 	usage: UsageMetrics;
+	diagnostics?: AgentRunDiagnostics;
 	assurance?: VerificationAssurance;
 	/** Evidence captured by the host while verifier tools execute. Model output cannot populate this field. */
 	hostEvidence?: EvidenceRef[];

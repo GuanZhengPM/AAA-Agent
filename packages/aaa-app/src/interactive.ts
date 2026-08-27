@@ -14,27 +14,33 @@ import type {
 	AdaptiveHarnessEvent,
 	AdaptiveHarnessResult,
 	AgentConversationMessage,
+	LedgerEntry,
 	LongRunCheckpoint,
 	Model,
 	ServiceTier,
 	StructuredContextState,
 	ThinkingMode,
 } from "@aaa-agent/runtime";
-import { updateStructuredContextState } from "@aaa-agent/runtime";
+import {
+	extractLedgerEntries,
+	mergeLedger,
+	resolveHistoryWorkingBudget,
+	updateStructuredContextState,
+} from "@aaa-agent/runtime";
 import { createShellInvocation, type ShellApprovalRequest } from "@aaa-agent/workspace";
 import type { AdaptiveRuntimeAgentEvent } from "./runtime";
 import {
 	acquireSessionLease,
 	createInteractiveSession,
 	type InteractiveSession,
+	partitionForDigest,
+	resolveDigestBudget,
+	rollDigest,
 	type SessionHistoryMatch,
 	type SessionLease,
 	type SessionSummary,
 } from "./session-store";
 import { TaskTerminalReporter } from "./terminal";
-
-const MAX_HISTORY_MESSAGES = 40;
-const MAX_HISTORY_CHARACTERS = 120_000;
 
 const TERMINAL_LOGO = [
 	" █████╗  █████╗  █████╗ ",
@@ -90,6 +96,8 @@ export type InteractiveAction =
 
 export interface InteractiveTaskRequest {
 	task: string;
+	/** Stable persisted session id used for provider cache affinity. */
+	sessionId: string;
 	model: Model;
 	thinkingMode: ThinkingMode;
 	serviceTier?: ServiceTier;
@@ -198,10 +206,6 @@ export class ConversationHistory {
 			this.#messages.push({ ...message });
 			this.#characters += message.text.length;
 		}
-		while (this.#messages.length > MAX_HISTORY_MESSAGES || this.#characters > MAX_HISTORY_CHARACTERS) {
-			const removed = this.#messages.splice(0, Math.min(2, this.#messages.length));
-			for (const message of removed) this.#characters -= message.text.length;
-		}
 	}
 
 	addExchange(user: string, assistant: string): void {
@@ -212,10 +216,6 @@ export class ConversationHistory {
 		for (const message of messages) {
 			this.#messages.push(message);
 			this.#characters += message.text.length;
-		}
-		while (this.#messages.length > MAX_HISTORY_MESSAGES || this.#characters > MAX_HISTORY_CHARACTERS) {
-			const removed = this.#messages.splice(0, Math.min(2, this.#messages.length));
-			for (const message of removed) this.#characters -= message.text.length;
 		}
 	}
 
@@ -277,7 +277,11 @@ async function runLocalShell(command: string, cwd: string): Promise<number> {
 	return child.exited;
 }
 
-function recoverCompletedExchange(session: InteractiveSession, history: ConversationHistory): string | undefined {
+function recoverCompletedExchange(
+	session: InteractiveSession,
+	history: ConversationHistory,
+	record?: (user: string, assistant: string) => void,
+): string | undefined {
 	const output = session.longRun?.completedOutput;
 	if (
 		!session.pendingTask ||
@@ -287,6 +291,7 @@ function recoverCompletedExchange(session: InteractiveSession, history: Conversa
 	) {
 		return undefined;
 	}
+	record?.(session.pendingTask, output);
 	history.addExchange(session.pendingTask, output);
 	session.pendingTask = undefined;
 	delete session.longRun;
@@ -295,6 +300,7 @@ function recoverCompletedExchange(session: InteractiveSession, history: Conversa
 
 export async function runInteractiveTerminal(options: InteractiveTerminalOptions): Promise<void> {
 	const input = options.input ?? process.stdin;
+	const inputEvents = input as NodeJS.ReadableStream;
 	const output = options.output ?? process.stdout;
 	const color = terminalSupportsColor(output);
 	let session =
@@ -320,14 +326,41 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		rl.close();
 		input.pause();
 	};
-	const history = new ConversationHistory(session.messages);
-	const recoveredOutput = recoveredSession ? recoverCompletedExchange(session, history) : undefined;
 	let model = options.model;
 	let thinkingMode = resolveDefaultThinkingMode(model, session.thinkingMode);
 	let serviceTier = resolveServiceTier(model, session.serviceTier);
 	let cwd = path.resolve(session.cwd);
+	/** Full verbatim transcript — independent of the compacted live window. */
+	let transcript: AgentConversationMessage[] = [...session.messages];
+	const initialCovered = Math.min(session.digest?.coveredMessages ?? 0, transcript.length);
+	const history = new ConversationHistory(transcript.slice(initialCovered));
+	const recordExchange = (user: string, assistant: string): void => {
+		transcript.push({ role: "user", text: user }, { role: "assistant", text: assistant });
+	};
+	const compactLiveHistory = (currentTask = ""): void => {
+		const safetyBudget = resolveDigestBudget(model.contextWindow);
+		const workingBudget = resolveHistoryWorkingBudget(model.contextWindow, currentTask.length);
+		const digestBudget = {
+			trigger: Math.min(safetyBudget.trigger, workingBudget.trigger),
+			keepRecent: Math.min(safetyBudget.keepRecent, workingBudget.keepRecent),
+			maxDigest: Math.min(safetyBudget.maxDigest, workingBudget.maxDigest),
+		};
+		if (history.characters <= digestBudget.trigger) return;
+		const { keep, evict } = partitionForDigest(history.snapshot(), digestBudget.keepRecent);
+		if (evict.length === 0) return;
+		const coveredBefore = Math.min(session.digest?.coveredMessages ?? 0, transcript.length);
+		session.digest = {
+			text: rollDigest(session.digest?.text, evict, digestBudget.maxDigest),
+			updatedAt: Date.now(),
+			coveredMessages: Math.min(transcript.length, coveredBefore + evict.length),
+		};
+		history.replace(keep);
+	};
+	const recoveredOutput = recoveredSession ? recoverCompletedExchange(session, history, recordExchange) : undefined;
+	compactLiveHistory();
 	let showTools = true;
 	let verbose = false;
+	const sessionApprovedShellCommands = new Set<string>();
 	let adaptive = options.adaptive;
 	let pendingResume =
 		recoveredSession && session.pendingTask && (!session.longRun || session.longRun.status === "interrupted")
@@ -346,7 +379,13 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 	const onReadlineInterrupt = (): void => {
 		if (runningTask) activeController?.abort("Interrupted by user");
 	};
+	const onRawInput = (chunk: unknown): void => {
+		if (!runningTask) return;
+		const text = typeof chunk === "string" ? chunk : Buffer.isBuffer(chunk) ? chunk.toString("utf8") : "";
+		if (text.includes("\u0003")) activeController?.abort("Interrupted by user");
+	};
 	rl.on("SIGINT", onReadlineInterrupt);
+	inputEvents.on("data", onRawInput);
 	const write = (value = ""): void => {
 		output.write(`${value}\n`);
 	};
@@ -356,7 +395,9 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		session.thinkingMode = thinkingMode;
 		if (serviceTier) session.serviceTier = serviceTier;
 		else delete session.serviceTier;
-		session.messages = history.snapshot();
+		// Persist the full transcript; the live (compacted) window is rebuild-time
+		// derived from digest + recent messages instead of replacing history.
+		session.messages = [...transcript];
 		if (status === "active" || status === "running") session.ownerPid = process.pid;
 		else delete session.ownerPid;
 		session.status = status;
@@ -380,8 +421,11 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			thinkingMode = resolveDefaultThinkingMode(nextModel, selected.thinkingMode);
 			serviceTier = resolveServiceTier(nextModel, selected.serviceTier);
 			cwd = path.resolve(selected.cwd);
-			history.replace(selected.messages);
-			const selectedRecoveredOutput = recoverCompletedExchange(selected, history);
+			transcript = [...selected.messages];
+			const covered = Math.min(selected.digest?.coveredMessages ?? 0, transcript.length);
+			history.replace(transcript.slice(covered));
+			const selectedRecoveredOutput = recoverCompletedExchange(selected, history, recordExchange);
+			compactLiveHistory();
 			pendingResume =
 				selected.pendingTask && (!selected.longRun || selected.longRun.status === "interrupted")
 					? selected.pendingTask
@@ -416,7 +460,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		write(`context    ${history.turns} turns · ${history.characters.toLocaleString()} chars`);
 		if (session.contextState) {
 			write(
-				`durable    ${session.contextState.userGoals.length} goals · ${session.contextState.verifiedFacts.length} facts · ${session.contextState.artifacts.length} artifacts`,
+				`durable    ${session.contextState.userGoals.length} goals · ${session.contextState.verifiedFacts.length} facts · ${session.contextState.artifacts.length} artifacts · ${(session.contextState.ledger ?? []).length} ledger`,
 			);
 		}
 		write(`session    ${session.id} · ${session.status}`);
@@ -514,6 +558,8 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			}
 			if (action.type === "clear") {
 				history.clear();
+				transcript = [];
+				delete session.digest;
 				delete session.contextState;
 				session.pendingTask = undefined;
 				delete session.longRun;
@@ -529,6 +575,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 				sessionLease = nextLease;
 				session = nextSession;
 				history.clear();
+				transcript = [];
 				await persist("active");
 				write(`Started session ${session.id}.`);
 				continue;
@@ -687,6 +734,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 					sessionLease = nextLease;
 					cwd = next;
 					history.clear();
+					transcript = [];
 					session = nextSession;
 					await persist("active");
 					write(`Workspace: ${shortenedPath(cwd)}. Started session ${session.id}.`);
@@ -714,6 +762,9 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			}
 			if (action.type !== "task") continue;
 
+			// Economic working-set compaction happens before request construction, so
+			// the agent loop never has to bluntly hide undigested history.
+			compactLiveHistory(action.task);
 			const controller = new AbortController();
 			activeController = controller;
 			if (inputClosed || terminating) {
@@ -733,24 +784,55 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			try {
 				const result = await options.runTask({
 					task: action.task,
+					sessionId: session.id,
 					model,
 					thinkingMode,
 					...(serviceTier ? { serviceTier } : {}),
 					cwd,
-					conversation: history.snapshot(),
+					conversation: session.digest?.text
+						? [
+								{
+									role: "user" as const,
+									text: `<session-digest>\n${session.digest.text}\n</session-digest>\n(Distilled memory of earlier exchanges in this session. The raw transcript stays fully searchable.)`,
+								},
+								{
+									role: "assistant" as const,
+									text: "Digest acknowledged. Earlier-session context retained.",
+								},
+								...history.snapshot(),
+							]
+						: history.snapshot(),
 					...(session.contextState ? { contextState: structuredClone(session.contextState) } : {}),
 					...(resumableCheckpoint ? { checkpoint: resumableCheckpoint } : {}),
 					onCheckpoint: async checkpoint => {
 						session.longRun = checkpoint;
 						session.contextState = updateStructuredContextState(session.contextState, action.task, checkpoint);
+						// Durable conversation ledger: host-extracted corrections, invariants
+						// and deliverables survive even when raw history is evicted.
+						const turnOrdinal = history.turns + 1;
+						const extracted: LedgerEntry[] = extractLedgerEntries(action.task, turnOrdinal);
+						if (extracted.length > 0) {
+							session.contextState = {
+								...session.contextState,
+								ledger: mergeLedger(session.contextState?.ledger ?? [], extracted),
+							};
+						}
 						await persist("running");
 					},
 					approveShell: async request => {
+						const approvalKey = `${path.resolve(request.cwd)}\u0000${request.command}`;
+						if (sessionApprovedShellCommands.has(approvalKey)) return true;
 						write(
 							`Shell approval required (${request.reason}):\n  ${request.command}\n  workspace: ${shortenedPath(request.cwd)}\n  This command can read files outside the workspace.`,
 						);
-						const answer = await question("Approve this command? [y/N] ");
-						return answer?.trim().toLowerCase() === "y" || answer?.trim().toLowerCase() === "yes";
+						const answer = (await question("Approve this command? [y/N] (a = always this exact command): "))
+							?.trim()
+							.toLowerCase();
+						if (answer === "a" || answer === "always") {
+							sessionApprovedShellCommands.add(approvalKey);
+							return true;
+						}
+						return answer === "y" || answer === "yes";
 					},
 					adaptive,
 					signal: controller.signal,
@@ -763,7 +845,11 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 					);
 				}
 				reporter.finish(result);
-				if (result.output.trim()) history.addExchange(action.task, result.output);
+				if (result.output.trim()) {
+					recordExchange(action.task, result.output);
+					history.addExchange(action.task, result.output);
+				}
+				compactLiveHistory();
 				if (result.success) {
 					session.pendingTask = undefined;
 					delete session.longRun;
@@ -789,6 +875,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		process.removeListener("SIGHUP", onTermination);
 		rl.removeListener("close", onInputClose);
 		rl.removeListener("SIGINT", onReadlineInterrupt);
+		inputEvents.removeListener("data", onRawInput);
 		try {
 			if (terminating) {
 				await persist(session.status === "interrupted" ? "interrupted" : "closed");
