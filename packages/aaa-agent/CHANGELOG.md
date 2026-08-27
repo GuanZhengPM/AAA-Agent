@@ -54,6 +54,7 @@
 
 ### Fixed
 
+- Interactive model selection now supports arrow-key navigation, numeric choices with optional punctuation, full menu labels, model names, bare IDs, and provider-qualified IDs without leaking picker input into chat.
 - Progressively exposes gated tools when requested or after repeated failures, blocks identical tool-call loops, and stops after sustained no-progress failures.
 - Preserved explicit thinking-off and native effort choices across adaptive routing instead of treating minimum effort as disabled reasoning.
 - Forwarded native reasoning-disable and service-tier controls through OpenAI Responses, OpenAI-compatible Chat Completions, Anthropic Messages, primary, Subagent, and verifier requests.

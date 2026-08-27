@@ -7,6 +7,8 @@ import {
 	createInteractiveSession,
 	type InteractiveSession,
 	type InteractiveTerminalOptions,
+	parseInteractiveInput,
+	resolveModelSelection,
 	runInteractiveTerminal,
 	TaskTerminalReporter,
 } from "@aaa-agent/app";
@@ -33,6 +35,13 @@ const model: Model = {
 	efforts: [Effort.Low],
 	supportsThinkingOff: true,
 	authChannel: "local",
+};
+
+const terraModel: Model = {
+	...model,
+	provider: "test-terra",
+	id: "terminal-terra",
+	name: "Terminal Terra",
 };
 
 const modelVariant = createModelVariant(model, {
@@ -68,6 +77,20 @@ function outputStream(): { stream: PassThrough; text(): string } {
 		text += chunk.toString();
 	});
 	return { stream, text: () => text };
+}
+
+function rawInputStream(): PassThrough & { isTTY: true; isRaw: boolean; setRawMode(mode: boolean): void } {
+	const stream = new PassThrough() as PassThrough & {
+		isTTY: true;
+		isRaw: boolean;
+		setRawMode(mode: boolean): void;
+	};
+	stream.isTTY = true;
+	stream.isRaw = false;
+	stream.setRawMode = mode => {
+		stream.isRaw = mode;
+	};
+	return stream;
 }
 
 async function waitForOutput(
@@ -109,6 +132,28 @@ afterEach(async () => {
 	await Promise.all(tempDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
 });
 
+describe("interactive model selection", () => {
+	it("accepts menu numbers, dotted numbers, full labels, names, ids, and provider-qualified ids", () => {
+		const models = [model, terraModel];
+		for (const selection of [
+			"2",
+			"2.",
+			"2. Terminal Terra (test-terra/terminal-terra)",
+			"model › 2. Terminal Terra (test-terra/terminal-terra)",
+			"Terminal Terra",
+			"terminal-terra",
+			"test-terra/terminal-terra",
+		]) {
+			const selected = resolveModelSelection(selection, models);
+			expect(`${selected.provider}/${selected.id}`).toBe("test-terra/terminal-terra");
+		}
+		expect(parseInteractiveInput("you › model › 2. Terminal Terra (test-terra/terminal-terra)")).toEqual({
+			type: "model",
+			value: "2. Terminal Terra (test-terra/terminal-terra)",
+		});
+	});
+});
+
 describe("interactive terminal lifecycle", () => {
 	it("renders concurrent tool lifecycles as complete independent lines", () => {
 		const chunks: string[] = [];
@@ -140,6 +185,48 @@ describe("interactive terminal lifecycle", () => {
 			"tool › Shell echo b ✓ 2ms",
 			"tool › Read a.ts ✓ 3ms",
 		]);
+	});
+
+	it("selects a provider-qualified model with arrow keys and leaves no input behind", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-model-picker-"));
+		tempDirectories.push(home);
+		const previousHome = process.env.AAA_AGENT_HOME;
+		process.env.AAA_AGENT_HOME = home;
+		try {
+			const input = rawInputStream();
+			const output = outputStream();
+			const preferences: string[] = [];
+			const running = runInteractiveTerminal({
+				model,
+				models: [model, terraModel],
+				thinkingMode: Effort.Low,
+				cwd: home,
+				adaptive: false,
+				input,
+				output: output.stream,
+				runTask: async () => completedResult("unexpected task"),
+				savePreferences: async selected => {
+					preferences.push(`${selected.provider}/${selected.id}`);
+				},
+				setAdaptive: async () => {},
+				saveSession: async () => {},
+			});
+			await waitForOutput(output, text => text.includes("you ›"));
+			input.write("/model\n");
+			await waitForOutput(output, text => text.includes("[↑/↓ · Enter · Esc]"));
+			input.write("\u001b[B");
+			await waitForOutput(output, text => text.includes("model › 2. Terminal Terra"));
+			input.write("\r");
+			await waitForOutput(output, text => text.includes("Using Terminal Terra"));
+			input.write("/exit\n");
+			await running;
+			expect(preferences).toEqual(["test-terra/terminal-terra"]);
+			expect(stripTerminalControls(output.text())).not.toContain("unexpected task");
+			expect(input.isRaw).toBe(false);
+		} finally {
+			if (previousHome === undefined) delete process.env.AAA_AGENT_HOME;
+			else process.env.AAA_AGENT_HOME = previousHome;
+		}
 	});
 
 	it("keeps Ctrl-C recoverable and persists a task when terminal input closes", async () => {

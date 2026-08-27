@@ -158,7 +158,7 @@ aaa route "检查认证和存储实现，并列出风险"
 
 | 命令 | 用途 |
 | --- | --- |
-| `/model` | 切换模型 |
+| `/model [序号|名称|provider/id]` | 用上下键、序号、模型名称或完整 ID 切换模型 |
 | `/effort` | 选择推理强度或 `auto` |
 | `/tier`、`/fast` | 选择模型支持的服务层级 |
 | `/status` | 查看模型、工作区、上下文和任务状态 |
@@ -394,7 +394,7 @@ Session commands:
 
 | Command | Purpose |
 | --- | --- |
-| `/model` | Select a model |
+| `/model [number|name|provider/id]` | Select with arrow keys, a number, model name, or qualified ID |
 | `/effort` | Select a reasoning effort or `auto` |
 | `/tier`, `/fast` | Select a supported service tier |
 | `/status` | Show model, workspace, context, and task state |

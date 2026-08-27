@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { emitKeypressEvents } from "node:readline";
 import * as readline from "node:readline/promises";
 import {
 	assertModelSupportsServiceTier,
@@ -54,7 +55,7 @@ const TERMINAL_LOGO = [
 
 const HELP = `Session commands:
   /help                 Show this help
-  /model                Select a model
+  /model [number|name]  Select with ↑/↓, number, name, id, or provider/id
   /effort               Select auto, off, or a native reasoning effort
   /tier                  Select a native service tier
   /fast <on|off>         Toggle priority/fast serving
@@ -138,8 +139,13 @@ function optionalValue(value: string): { value?: string } {
 }
 
 export function parseInteractiveInput(input: string): InteractiveAction {
-	const trimmed = input.trim();
+	const trimmed = input
+		.trim()
+		.replace(/^(?:you\s*›\s*)+/i, "")
+		.trim();
 	if (!trimmed) return { type: "empty" };
+	const modelPrompt = trimmed.match(/^model\s*›\s*(.+)$/i);
+	if (modelPrompt?.[1]) return { type: "model", value: modelPrompt[1].trim() };
 	if (trimmed.startsWith("!")) {
 		const command = trimmed.slice(1).trim();
 		return command ? { type: "shell", command } : { type: "empty" };
@@ -257,14 +263,141 @@ function parseToggle(value: string | undefined, current: boolean): boolean {
 	throw new Error("Expected 'on' or 'off'.");
 }
 
-function resolveModelSelection(value: string, models: readonly Model[]): Model {
-	if (/^\d+$/.test(value)) {
-		const index = Number(value) - 1;
+function modelReference(model: Model): string {
+	return `${model.provider}/${model.id}`;
+}
+
+export function resolveModelSelection(value: string, models: readonly Model[]): Model {
+	const normalized = value
+		.trim()
+		.replace(/^model\s*›\s*/i, "")
+		.trim();
+	const indexed = normalized.match(/^[*›>]*\s*(\d+)(?:\s*[.)](?:\s+.*)?)?\s*$/);
+	if (indexed?.[1]) {
+		const index = Number(indexed[1]) - 1;
 		const model = models[index];
 		if (!model) throw new Error(`Model selection must be between 1 and ${models.length}.`);
 		return model;
 	}
-	return resolveModel(value, models);
+	const labeledReference = normalized.match(/\(([^()]+)\)\s*$/)?.[1]?.trim();
+	if (labeledReference) {
+		try {
+			return resolveModel(labeledReference, models);
+		} catch {}
+	}
+	const byName = models.filter(candidate => candidate.name.toLowerCase() === normalized.toLowerCase());
+	if (byName.length === 1 && byName[0]) return byName[0];
+	if (byName.length > 1) {
+		throw new Error(`Ambiguous model name '${value}'. Use provider/model-id.`);
+	}
+	return resolveModel(normalized, models);
+}
+
+interface RawTerminalInput extends NodeJS.ReadableStream {
+	isTTY?: boolean;
+	isRaw?: boolean;
+	setRawMode(mode: boolean): unknown;
+}
+
+interface TerminalKey {
+	name?: string;
+	sequence?: string;
+	ctrl?: boolean;
+	meta?: boolean;
+}
+
+function supportsKeyboardSelection(
+	input: NodeJS.ReadableStream,
+	output: NodeJS.WritableStream,
+): input is RawTerminalInput {
+	return (
+		"isTTY" in input &&
+		input.isTTY === true &&
+		"isTTY" in output &&
+		output.isTTY === true &&
+		"setRawMode" in input &&
+		typeof input.setRawMode === "function"
+	);
+}
+
+async function selectModelWithKeyboard(
+	input: RawTerminalInput,
+	output: NodeJS.WritableStream,
+	rl: readline.Interface,
+	models: readonly Model[],
+	current: Model,
+): Promise<string | undefined> {
+	if (models.length === 0) return undefined;
+	emitKeypressEvents(input);
+	const suspendedKeypressListeners = input.listeners("keypress");
+	for (const listener of suspendedKeypressListeners) input.removeListener("keypress", listener);
+	const wasRaw = input.isRaw === true;
+	let selected = Math.max(
+		0,
+		models.findIndex(candidate => modelReference(candidate) === modelReference(current)),
+	);
+	let typed = "";
+	let settled = false;
+	rl.pause();
+	input.setRawMode(true);
+	input.resume();
+
+	return new Promise<string | undefined>(resolve => {
+		const redraw = (): void => {
+			const candidate = models[selected]!;
+			const value = typed || `${selected + 1}. ${candidate.name} (${modelReference(candidate)})`;
+			output.write(`\r\u001b[2Kmodel › ${value}  [↑/↓ · Enter · Esc]`);
+		};
+		const cleanup = (resume: boolean): void => {
+			input.removeListener("keypress", onKeypress);
+			rl.removeListener("close", onClose);
+			try {
+				input.setRawMode(wasRaw);
+			} catch {
+				// A closing terminal may already have detached the underlying TTY.
+			}
+			for (const listener of suspendedKeypressListeners) input.on("keypress", listener);
+			if (resume) rl.resume();
+			output.write("\n");
+		};
+		const finish = (value: string | undefined, resume = true): void => {
+			if (settled) return;
+			settled = true;
+			cleanup(resume);
+			resolve(value);
+		};
+		const onClose = (): void => finish(undefined, false);
+		const onKeypress = (character: string, key: TerminalKey = {}): void => {
+			if (key.name === "up" || key.name === "down") {
+				selected =
+					key.name === "up" ? (selected - 1 + models.length) % models.length : (selected + 1) % models.length;
+				typed = "";
+				redraw();
+				return;
+			}
+			if (key.name === "return" || key.name === "enter") {
+				finish(typed.trim() || String(selected + 1));
+				return;
+			}
+			if (key.name === "escape" || (key.ctrl && (key.name === "c" || key.name === "d"))) {
+				finish(undefined);
+				return;
+			}
+			if (key.name === "backspace") {
+				typed = typed.slice(0, -1);
+				redraw();
+				return;
+			}
+			const text = character || key.sequence || "";
+			if (!key.ctrl && !key.meta && text && !text.startsWith("\u001b") && [...text].every(char => char >= " ")) {
+				typed += text;
+				redraw();
+			}
+		};
+		input.on("keypress", onKeypress);
+		rl.once("close", onClose);
+		redraw();
+	});
 }
 
 async function runLocalShell(command: string, cwd: string): Promise<number> {
@@ -640,10 +773,12 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 				let selection = action.value;
 				if (!selection) {
 					for (const [index, candidate] of models.entries()) {
-						const marker = candidate.id === model.id ? "*" : " ";
-						write(`${marker} ${index + 1}. ${candidate.name} (${candidate.id})`);
+						const marker = modelReference(candidate) === modelReference(model) ? "*" : " ";
+						write(`${marker} ${index + 1}. ${candidate.name} (${modelReference(candidate)})`);
 					}
-					selection = (await question("model › "))?.trim();
+					selection = supportsKeyboardSelection(input, output)
+						? await selectModelWithKeyboard(input, output, rl, models, model)
+						: (await question("model › "))?.trim();
 				}
 				if (!selection) continue;
 				try {
