@@ -1,5 +1,5 @@
 import type { AgentFunctionCall, AgentTurnOptions, AgentTurnProvider, AgentTurnResult } from "@aaa-agent/runtime";
-import type { CodexAuthSession } from "./auth";
+import type { AdaptiveAuthSession } from "./auth";
 import { createResponsesRequestBody, runResponsesTransport } from "./responses-transport";
 
 const ORIGINATOR = "aaa_agent";
@@ -10,7 +10,7 @@ export type CodexFunctionCall = AgentFunctionCall;
 export type CodexTurnResult = AgentTurnResult;
 
 export interface CodexTurnOptions extends AgentTurnOptions {
-	auth: CodexAuthSession;
+	auth: AdaptiveAuthSession;
 }
 
 export function createCodexHeaders(accessToken: string, accountId: string | undefined, sessionId: string): Headers {
@@ -56,7 +56,7 @@ export async function runCodexTurn(options: CodexTurnOptions): Promise<CodexTurn
 	});
 }
 
-export function createCodexProvider(auth: CodexAuthSession): AgentTurnProvider {
+export function createCodexProvider(auth: AdaptiveAuthSession): AgentTurnProvider {
 	const identity = auth.identity();
 	return {
 		provider: "openai-codex",

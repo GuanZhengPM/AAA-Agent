@@ -29,6 +29,12 @@ for (const [packageDirectory, rule] of Object.entries(rules)) {
 			failures.push(`${relativeFile}: compatibility package contains a non-entrypoint source file`);
 		}
 		const source = await Bun.file(file).text();
+		if (
+			packageDirectory === "aaa-providers" &&
+			/(?:@oh-my-pi|@mariozechner\/pi-|https?:\/\/[^\s"']*\bpi(?:\.|\/))/i.test(source)
+		) {
+			failures.push(`${relativeFile}: provider/auth code must not depend on or redirect through pi`);
+		}
 		for (const match of source.matchAll(importPattern)) {
 			const dependency = match[1];
 			if (dependency && !rule.allowed.has(dependency)) {

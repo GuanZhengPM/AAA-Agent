@@ -27,6 +27,9 @@
 - Added optional `--verifier-model` isolation, host-bound evidence ledgers, and verification assurance labels so model prose cannot fabricate completion evidence or silently train outcome capability scores.
 - Added bounded structured session context for durable goals, evidence-backed facts and artifacts, open risks, and recovery guidance beyond raw conversation retention.
 - Added explicit one-shot Shell policies (`deny`, `ask`, `sandbox`, and `allow`), with `deny` as the non-interactive default.
+- Added an AAA-owned, versioned multi-provider credential store with hidden API-key input, environment overrides, per-provider status/logout, and migration from the legacy Codex-only credential file.
+- Added direct official OAuth flows for Kimi Code, GLM Coding Plan, and Claude Code alongside Codex OAuth; browser flows return to AAA's localhost callback and never route through a pi URL.
+- Added bundled Claude Code subscription variants and persistent API-key login for DeepSeek, Z.AI, Moonshot/Kimi, Anthropic, OpenRouter, xAI, MiniMax, MiMo, and custom providers.
 
 ### Changed
 
@@ -46,6 +49,7 @@
 - Made turn, tool-call, output-token, and total-token limits hard runtime ceilings while keeping large Shell output bounded.
 - Made token ceilings task-wide across Primary, Verifier, and Subagent sessions, capped each Verifier at 20% of the total, and limited automatic recovery to one repair before checkpointing.
 - Targeted verification now accepts a fresh deterministic check after the latest workspace mutation without starting another model session.
+- Provider clients now resolve credentials per request, refresh expiring Kimi/Claude/Codex OAuth grants, retry one OAuth 401 after refresh, and emit the provider-specific bearer, beta, and Kimi device headers.
 
 
 ### Fixed

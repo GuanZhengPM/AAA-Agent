@@ -36,7 +36,8 @@ AAA Agent（`aaa`）是一个使用 Bun 和 TypeScript 开发的终端编程 Age
 - **审计与验证**：完成状态必须绑定运行时证据；
 - **任务恢复**：长任务保存 checkpoint，可在中断后继续；
 - **持久会话**：append-only 保存完整 transcript，并按模型/成本动态压缩实时工作集；
-- **Provider 效率**：稳定会话缓存、统一退避重试、流式响应和 Provider 级并发限制。
+- **Provider 效率**：稳定会话缓存、统一退避重试、流式响应和 Provider 级并发限制；
+- **独立多 Provider 认证**：AAA 自己完成 Codex、Kimi Code、GLM Coding Plan、Claude Code OAuth，并支持安全保存 API Key。
 
 项目由五个 Bun workspace 包组成，不依赖服务端或数据库。
 
@@ -75,13 +76,33 @@ aaa --help
 
 ### 登录与模型
 
-内置的 Codex 模型可以通过 ChatGPT/Codex OAuth 登录：
+认证由 AAA Agent 自己实现，不依赖 pi 的认证内核，也不会跳转到 pi 的 URL。OAuth 只会打开对应厂商的官方地址（`auth.openai.com`、`auth.kimi.com`、`chat.z.ai`、`claude.ai`）并回调本机 `localhost`。
+
+| Provider | 登录方式 | 内置模型示例 |
+| --- | --- | --- |
+| ChatGPT / Codex | 浏览器 OAuth | `openai-codex/gpt-5.6-sol` |
+| Kimi Code | Device OAuth；也可使用 Console Key | `kimi-code/k3` |
+| GLM Coding Plan | 浏览器登录并为 AAA 创建独立 Coding Plan Key；也可直接填 Key | `z-ai-coding/glm-5.2` |
+| Claude Code | Claude Pro/Max 浏览器 OAuth | `claude-code/claude-sonnet-5` |
+| DeepSeek、Z.AI、Moonshot/Kimi、Anthropic、OpenRouter、xAI、MiniMax、MiMo | API Key 或环境变量 | 运行 `aaa models` 查看 |
+
+常用认证命令：
 
 ```sh
-aaa auth login
-aaa auth status
-aaa auth logout
+aaa auth providers                         # 查看支持的登录方式
+aaa auth login                             # 向后兼容：登录 Codex
+aaa auth login kimi-code                   # Kimi Device OAuth
+aaa auth login z-ai-coding                 # GLM Coding Plan 浏览器登录
+aaa auth login claude-code                 # Claude Pro/Max OAuth
+aaa auth set-key deepseek                  # 隐藏输入，不回显 key
+printf '%s' "$DEEPSEEK_API_KEY" | aaa auth set-key deepseek --stdin
+aaa auth login kimi-code --api-key         # 不使用 OAuth，改存 Console Key
+aaa auth status [provider]
+aaa auth logout [provider]
+aaa auth logout --all
 ```
+
+不要把 key 直接放在命令参数中，以免进入 shell history。显式环境变量优先于 `~/.aaa-agent/credentials.json` 中保存的凭据；内置变量包括 `DEEPSEEK_API_KEY`、`ZAI_API_KEY`、`ZAI_CODING_PLAN_API_KEY`、`MOONSHOT_API_KEY`、`KIMI_CODE_API_KEY`、`ANTHROPIC_API_KEY`、`CLAUDE_CODE_OAUTH_TOKEN` 等。凭据文件使用 `0600` 权限，状态输出永不打印 secret；旧版单一 Codex 凭据会自动迁移。
 
 查看和切换模型：
 
@@ -91,7 +112,7 @@ aaa models
 aaa use openai-codex/gpt-5.6-sol
 ```
 
-也可以在 `~/.aaa-agent/models.json` 中添加 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 或本地 OpenAI-compatible 模型。API Key 通过模型配置里的环境变量名读取，不需要写进配置文件。
+也可以在 `~/.aaa-agent/models.json` 中添加 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 或本地 OpenAI-compatible 模型。自定义 Provider 可以通过模型配置中的 `apiKeyEnv` 读取环境变量，也可以运行 `aaa auth set-key <provider>` 写入独立凭据仓。
 
 一个最小的本地模型配置：
 
@@ -175,7 +196,7 @@ macOS 的 sandbox 会限制写入和网络，但不是保密边界；不要把�
 ```text
 aaa-agent                  对外 SDK 和 `aaa` 命令
 └── @aaa-agent/app          CLI、会话、提示词、终端输出
-    ├── @aaa-agent/providers   模型目录、OAuth、Provider 协议
+    ├── @aaa-agent/providers   模型目录、独立 OAuth/API Key 凭据仓、Provider 协议
     │   └── @aaa-agent/runtime
     ├── @aaa-agent/workspace   文件、搜索和 Shell 工具
     │   └── @aaa-agent/runtime
@@ -200,13 +221,13 @@ Guided 和 Orchestrated 任务使用有界的 `execute → audit → checkpoint 
 
 ```text
 ~/.aaa-agent/
-├── credentials.json   OAuth 凭据
+├── credentials.json   多 Provider OAuth/API Key 凭据（0600）
 ├── models.json        自定义模型，可选
 ├── state.json         默认模型和本地能力记录
 └── sessions/          小型 metadata JSON + append-only transcript JSONL
 ```
 
-可以通过 `AAA_AGENT_HOME=/path/to/dir` 改到其他位置。凭据和会话可能包含敏感信息，不要提交到仓库。
+可以通过 `AAA_AGENT_HOME=/path/to/dir` 改到其他位置。`credentials.json` 是受 `0600` 权限保护的本地 JSON，并非系统钥匙串或加密保险库；不希望 key 落盘时请只使用环境变量。凭据和会话可能包含敏感信息，不要提交到仓库。
 
 ### 开发
 
@@ -251,7 +272,8 @@ Key features:
 - **Audit and verification**: completion must be backed by runtime evidence;
 - **Task recovery**: long-running tasks persist checkpoints and resume after interruption;
 - **Persistent sessions**: append-only full transcripts with a model/cost-aware live working set;
-- **Provider efficiency**: stable cache affinity, unified retries, streaming, and provider-level concurrency limits.
+- **Provider efficiency**: stable cache affinity, unified retries, streaming, and provider-level concurrency limits;
+- **Independent multi-provider auth**: AAA owns Codex, Kimi Code, GLM Coding Plan, and Claude Code OAuth flows plus secure API-key storage.
 
 The project is organized as five Bun workspace packages and requires no server or database.
 
@@ -290,13 +312,33 @@ aaa --help
 
 ### Authentication and models
 
-Bundled Codex models support ChatGPT/Codex OAuth:
+Authentication is implemented by AAA Agent itself: it does not invoke pi's auth core or redirect through a pi URL. OAuth opens only the provider's official host (`auth.openai.com`, `auth.kimi.com`, `chat.z.ai`, or `claude.ai`) and returns to a localhost callback owned by AAA.
+
+| Provider | Authentication | Bundled model example |
+| --- | --- | --- |
+| ChatGPT / Codex | Browser OAuth | `openai-codex/gpt-5.6-sol` |
+| Kimi Code | Device OAuth or a Console key | `kimi-code/k3` |
+| GLM Coding Plan | Browser sign-in that provisions an AAA-specific plan key, or a pasted key | `z-ai-coding/glm-5.2` |
+| Claude Code | Claude Pro/Max browser OAuth | `claude-code/claude-sonnet-5` |
+| DeepSeek, Z.AI, Moonshot/Kimi, Anthropic, OpenRouter, xAI, MiniMax, MiMo | API key or environment variable | Run `aaa models` |
+
+Common authentication commands:
 
 ```sh
-aaa auth login
-aaa auth status
-aaa auth logout
+aaa auth providers
+aaa auth login                             # backward-compatible Codex login
+aaa auth login kimi-code
+aaa auth login z-ai-coding
+aaa auth login claude-code
+aaa auth set-key deepseek                  # hidden TTY input
+printf '%s' "$DEEPSEEK_API_KEY" | aaa auth set-key deepseek --stdin
+aaa auth login kimi-code --api-key         # use a Console key instead of OAuth
+aaa auth status [provider]
+aaa auth logout [provider]
+aaa auth logout --all
 ```
+
+Do not pass a secret as a command argument because it can enter shell history. An explicit environment variable takes precedence over the credential saved in `~/.aaa-agent/credentials.json`. Bundled variables include `DEEPSEEK_API_KEY`, `ZAI_API_KEY`, `ZAI_CODING_PLAN_API_KEY`, `MOONSHOT_API_KEY`, `KIMI_CODE_API_KEY`, `ANTHROPIC_API_KEY`, and `CLAUDE_CODE_OAUTH_TOKEN`. The store is mode `0600`, status output never prints secrets, and legacy single-Codex credentials migrate automatically.
 
 Inspect and select models:
 
@@ -306,7 +348,7 @@ aaa models
 aaa use openai-codex/gpt-5.6-sol
 ```
 
-Additional OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and local OpenAI-compatible models can be added in `~/.aaa-agent/models.json`. API keys are read from the environment variable named by the model entry, so the key itself does not need to live in the file.
+Additional OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and local OpenAI-compatible models can be added in `~/.aaa-agent/models.json`. A custom provider may read `apiKeyEnv` or use a credential saved with `aaa auth set-key <provider>`.
 
 A minimal local model entry:
 
@@ -390,7 +432,7 @@ The macOS sandbox limits writes and network access, but it is not a confidential
 ```text
 aaa-agent                  Public SDK and `aaa` command
 └── @aaa-agent/app          CLI, sessions, prompts, terminal reporting
-    ├── @aaa-agent/providers   Model catalog, OAuth, provider transports
+    ├── @aaa-agent/providers   Model catalog, independent OAuth/API-key store, provider transports
     │   └── @aaa-agent/runtime
     ├── @aaa-agent/workspace   File, search, and Shell tools
     │   └── @aaa-agent/runtime
@@ -415,13 +457,13 @@ AAA Agent stores local data under `~/.aaa-agent/` by default:
 
 ```text
 ~/.aaa-agent/
-├── credentials.json   OAuth credentials
+├── credentials.json   Multi-provider OAuth/API keys (mode 0600)
 ├── models.json        Optional custom models
 ├── state.json         Defaults and local capability observations
 └── sessions/          Small metadata JSON + append-only transcript JSONL
 ```
 
-Set `AAA_AGENT_HOME=/path/to/dir` to move it elsewhere. Credentials and sessions may contain sensitive data and should not be committed.
+Set `AAA_AGENT_HOME=/path/to/dir` to move it elsewhere. `credentials.json` is local JSON protected by mode `0600`, not an OS keychain or encrypted vault; use environment variables only if secrets must not be written to disk. Credentials and sessions may contain sensitive data and should not be committed.
 
 ### Development
 

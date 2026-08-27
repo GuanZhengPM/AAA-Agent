@@ -1,5 +1,20 @@
-import * as fs from "node:fs/promises";
-import { ensureAdaptiveHarnessDir, getCredentialPath } from "@aaa-agent/runtime";
+import type { Model } from "@aaa-agent/runtime";
+import {
+	type CredentialStoreFile,
+	clearStoredCredentials,
+	loadCredentialStore,
+	type ProviderCredentialResolver,
+	type ResolvedProviderCredential,
+	removeStoredCredential,
+	type StoredOAuthCredential,
+	type StoredProviderCredential,
+	saveCredentialStore,
+	setStoredCredential,
+} from "./credential-store";
+import { loginClaudeCodeOAuth, refreshClaudeCodeOAuth } from "./oauth-anthropic";
+import { launchExternalUrl } from "./oauth-callback";
+import { loginKimiCodeOAuth, refreshKimiCodeOAuth } from "./oauth-kimi";
+import { loginZaiCodingPlan } from "./oauth-zai";
 
 const CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTHORIZE_URL = "https://auth.openai.com/oauth/authorize";
@@ -34,13 +49,67 @@ interface OAuthTokenResponse {
 	expires_in?: unknown;
 }
 
+export interface AuthProviderDefinition {
+	id: string;
+	name: string;
+	mode: "oauth" | "api_key";
+	apiKeyEnv?: string;
+}
+
+const AUTH_PROVIDERS: readonly AuthProviderDefinition[] = [
+	{ id: "openai-codex", name: "ChatGPT / OpenAI Codex", mode: "oauth" },
+	{ id: "kimi-code", name: "Kimi Code", mode: "oauth", apiKeyEnv: "KIMI_CODE_API_KEY" },
+	{ id: "z-ai-coding", name: "GLM Coding Plan", mode: "oauth", apiKeyEnv: "ZAI_CODING_PLAN_API_KEY" },
+	{ id: "claude-code", name: "Claude Code (Claude Pro/Max)", mode: "oauth", apiKeyEnv: "CLAUDE_CODE_OAUTH_TOKEN" },
+	{ id: "deepseek", name: "DeepSeek API", mode: "api_key", apiKeyEnv: "DEEPSEEK_API_KEY" },
+	{ id: "z-ai", name: "Z.AI API", mode: "api_key", apiKeyEnv: "ZAI_API_KEY" },
+	{ id: "kimi", name: "Moonshot / Kimi API", mode: "api_key", apiKeyEnv: "MOONSHOT_API_KEY" },
+	{ id: "anthropic", name: "Anthropic API", mode: "api_key", apiKeyEnv: "ANTHROPIC_API_KEY" },
+	{ id: "openrouter", name: "OpenRouter", mode: "api_key", apiKeyEnv: "OPENROUTER_API_KEY" },
+	{ id: "xai", name: "xAI", mode: "api_key", apiKeyEnv: "XAI_API_KEY" },
+	{ id: "minimax", name: "MiniMax API", mode: "api_key", apiKeyEnv: "MINIMAX_API_KEY" },
+	{ id: "minimax-token", name: "MiniMax Token Plan", mode: "api_key", apiKeyEnv: "MINIMAX_TOKEN_PLAN_API_KEY" },
+	{ id: "xiaomi-mimo", name: "Xiaomi MiMo API", mode: "api_key", apiKeyEnv: "MIMO_API_KEY" },
+	{ id: "xiaomi-mimo-token", name: "Xiaomi MiMo Token Plan", mode: "api_key", apiKeyEnv: "MIMO_TOKEN_PLAN_API_KEY" },
+];
+
+const PROVIDER_ALIASES: Readonly<Record<string, string>> = {
+	codex: "openai-codex",
+	"chatgpt-codex": "openai-codex",
+	kimi: "kimi",
+	moonshot: "kimi",
+	"kimi-coding": "kimi-code",
+	glm: "z-ai",
+	zai: "z-ai",
+	"z.ai": "z-ai",
+	"glm-coding": "z-ai-coding",
+	"glm-coding-plan": "z-ai-coding",
+	"zai-coding": "z-ai-coding",
+	"zai-coding-plan": "z-ai-coding",
+	claude: "claude-code",
+	"anthropic-oauth": "claude-code",
+};
+
+export function listAuthProviders(): AuthProviderDefinition[] {
+	return AUTH_PROVIDERS.map(provider => ({ ...provider }));
+}
+
+export function normalizeAuthProvider(provider: string): string {
+	const normalized = provider.trim().toLowerCase();
+	return PROVIDER_ALIASES[normalized] ?? normalized;
+}
+
+export function authProviderDefinition(provider: string): AuthProviderDefinition | undefined {
+	const id = normalizeAuthProvider(provider);
+	return AUTH_PROVIDERS.find(candidate => candidate.id === id);
+}
+
 function decodeJwtPayload(token: string | undefined): Record<string, unknown> | undefined {
 	if (!token) return undefined;
 	try {
 		const payload = token.split(".")[1];
 		if (!payload) return undefined;
-		const decoded = Buffer.from(payload, "base64url").toString("utf8");
-		const parsed = JSON.parse(decoded);
+		const parsed: unknown = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
 		return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : undefined;
 	} catch {
 		return undefined;
@@ -64,8 +133,7 @@ function base64Url(bytes: Uint8Array): string {
 }
 
 async function createPkce(): Promise<{ verifier: string; challenge: string }> {
-	const random = crypto.getRandomValues(new Uint8Array(32));
-	const verifier = base64Url(random);
+	const verifier = base64Url(crypto.getRandomValues(new Uint8Array(32)));
 	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
 	return { verifier, challenge: base64Url(new Uint8Array(digest)) };
 }
@@ -86,14 +154,13 @@ export function buildAuthorizationUrl(options: AuthorizationUrlOptions): string 
 	return `${AUTHORIZE_URL}?${parameters}`;
 }
 
-async function requestTokens(parameters: URLSearchParams, signal?: AbortSignal): Promise<OAuthTokenResponse> {
+async function requestOpenAITokens(parameters: URLSearchParams, signal?: AbortSignal): Promise<OAuthTokenResponse> {
 	const timeout = AbortSignal.timeout(15_000);
-	const requestSignal = signal ? AbortSignal.any([signal, timeout]) : timeout;
 	const response = await fetch(TOKEN_URL, {
 		method: "POST",
 		headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
 		body: parameters,
-		signal: requestSignal,
+		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 	});
 	const text = await response.text();
 	if (!response.ok) throw new Error(`OpenAI token exchange failed (${response.status}): ${text.slice(0, 500)}`);
@@ -104,65 +171,33 @@ async function requestTokens(parameters: URLSearchParams, signal?: AbortSignal):
 	}
 }
 
-function credentialsFromResponse(response: OAuthTokenResponse, previous?: CodexCredentials): CodexCredentials {
-	if (typeof response.access_token !== "string" || response.access_token.length === 0) {
+function openAICredentialFromResponse(
+	response: OAuthTokenResponse,
+	previous?: StoredOAuthCredential,
+): StoredOAuthCredential {
+	if (typeof response.access_token !== "string" || !response.access_token) {
 		throw new Error("OpenAI token response did not include an access token");
 	}
 	const refreshToken =
-		typeof response.refresh_token === "string" && response.refresh_token.length > 0
+		typeof response.refresh_token === "string" && response.refresh_token
 			? response.refresh_token
 			: previous?.refreshToken;
 	if (!refreshToken) throw new Error("OpenAI token response did not include a refresh token");
-	const idToken = typeof response.id_token === "string" ? response.id_token : previous?.idToken;
+	const idToken = typeof response.id_token === "string" ? response.id_token : undefined;
 	const expiresIn = typeof response.expires_in === "number" && response.expires_in > 0 ? response.expires_in : 3600;
+	const identity = extractIdentity(response.access_token, idToken);
 	return {
+		type: "oauth",
 		accessToken: response.access_token,
 		refreshToken,
-		...(idToken ? { idToken } : {}),
 		expiresAt: Date.now() + expiresIn * 1000,
-		...extractIdentity(response.access_token, idToken),
+		authorizedAt: previous?.authorizedAt ?? Date.now(),
+		...((identity.accountId ?? previous?.accountId) ? { accountId: identity.accountId ?? previous?.accountId } : {}),
+		...((identity.email ?? previous?.email) ? { email: identity.email ?? previous?.email } : {}),
 	};
 }
 
-async function saveCredentials(credentials: CodexCredentials): Promise<void> {
-	await ensureAdaptiveHarnessDir();
-	const path = getCredentialPath();
-	await Bun.write(path, `${JSON.stringify(credentials, null, 2)}\n`);
-	if (process.platform !== "win32") await fs.chmod(path, 0o600);
-}
-
-async function loadCredentials(): Promise<CodexCredentials | undefined> {
-	try {
-		const value = await Bun.file(getCredentialPath()).json();
-		if (!value || typeof value !== "object") return undefined;
-		const candidate = value as Partial<CodexCredentials>;
-		if (
-			typeof candidate.accessToken !== "string" ||
-			typeof candidate.refreshToken !== "string" ||
-			typeof candidate.expiresAt !== "number"
-		) {
-			throw new Error(`Invalid credentials file: ${getCredentialPath()}`);
-		}
-		return candidate as CodexCredentials;
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "ENOENT") return undefined;
-		throw error;
-	}
-}
-
-function launchBrowser(url: string): void {
-	let command: string[];
-	if (process.platform === "darwin") command = ["open", url];
-	else if (process.platform === "win32") command = ["rundll32", "url.dll,FileProtocolHandler", url];
-	else command = ["xdg-open", url];
-	try {
-		Bun.spawn(command, { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
-	} catch {
-		// The URL is always printed, so browser launch is best-effort.
-	}
-}
-
-async function waitForAuthorizationCode(state: string, authUrl: string): Promise<string> {
+async function waitForOpenAIAuthorizationCode(state: string, authUrl: string): Promise<string> {
 	const completion = Promise.withResolvers<string>();
 	let settled = false;
 	let server: Bun.Server<unknown>;
@@ -173,25 +208,18 @@ async function waitForAuthorizationCode(state: string, authUrl: string): Promise
 			fetch(request) {
 				const url = new URL(request.url);
 				if (url.pathname !== CALLBACK_PATH) return new Response("Not found", { status: 404 });
-				const returnedState = url.searchParams.get("state");
-				const error = url.searchParams.get("error");
+				if (url.searchParams.get("state") !== state) return new Response("State mismatch.", { status: 400 });
+				const providerError = url.searchParams.get("error");
+				if (providerError) {
+					if (!settled) completion.reject(new Error(`OpenAI authorization failed: ${providerError}`));
+					settled = true;
+					return new Response(`Authorization failed: ${providerError}`, { status: 400 });
+				}
 				const code = url.searchParams.get("code");
-				if (returnedState !== state) {
-					if (!settled) completion.reject(new Error("OAuth state mismatch"));
-					settled = true;
-					return new Response("Authorization failed: state mismatch.", { status: 400 });
-				}
-				if (error) {
-					if (!settled) completion.reject(new Error(`OpenAI authorization failed: ${error}`));
-					settled = true;
-					return new Response(`Authorization failed: ${error}`, { status: 400 });
-				}
 				if (!code) return new Response("Missing authorization code.", { status: 400 });
 				if (!settled) completion.resolve(code);
 				settled = true;
-				return new Response("AAA Agent is authenticated. You can close this tab.", {
-					headers: { "content-type": "text/plain; charset=utf-8" },
-				});
+				return new Response("AAA Agent is authenticated. You can close this tab.");
 			},
 		});
 	} catch (error) {
@@ -199,8 +227,8 @@ async function waitForAuthorizationCode(state: string, authUrl: string): Promise
 			cause: error,
 		});
 	}
-	process.stdout.write(`\nOpen this OpenAI URL in your browser:\n${authUrl}\n\n`);
-	launchBrowser(authUrl);
+	process.stdout.write(`\nOpen this official OpenAI URL in your browser:\n${authUrl}\n\n`);
+	launchExternalUrl(authUrl);
 	try {
 		return await Promise.race([
 			completion.promise,
@@ -213,53 +241,178 @@ async function waitForAuthorizationCode(state: string, authUrl: string): Promise
 	}
 }
 
-export class CodexAuthSession {
-	#credentials: CodexCredentials | undefined;
+function environmentCredential(model: Model): ResolvedProviderCredential | undefined {
+	if (model.authChannel === "local" || model.api === "codex-responses") return undefined;
+	const envName = model.apiKeyEnv ?? (model.api === "anthropic-messages" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+	const secret = process.env[envName]?.trim();
+	if (!secret) return undefined;
+	return {
+		provider: model.provider,
+		kind: model.provider === "claude-code" ? "oauth" : "api_key",
+		secret,
+		source: `environment ${envName}`,
+	};
+}
 
-	constructor(credentials: CodexCredentials | undefined) {
-		this.#credentials = credentials;
+function resolvedStoredCredential(provider: string, credential: StoredProviderCredential): ResolvedProviderCredential {
+	if (credential.type === "api_key") {
+		return { provider, kind: "api_key", secret: credential.apiKey, source: "AAA credential store" };
+	}
+	return {
+		provider,
+		kind: "oauth",
+		secret: credential.accessToken,
+		source: "AAA OAuth",
+		expiresAt: credential.expiresAt,
+		...(credential.email ? { email: credential.email } : {}),
+		...(credential.accountId ? { accountId: credential.accountId } : {}),
+		...(credential.orgId ? { orgId: credential.orgId } : {}),
+		...(credential.orgName ? { orgName: credential.orgName } : {}),
+	};
+}
+
+export class AdaptiveAuthSession implements ProviderCredentialResolver {
+	#store: CredentialStoreFile;
+	#refreshing = new Map<string, Promise<StoredOAuthCredential>>();
+
+	constructor(store: CredentialStoreFile) {
+		this.#store = structuredClone(store);
 	}
 
-	hasAuth(): boolean {
-		return this.#credentials !== undefined;
+	hasAuth(model: Model): boolean {
+		if (model.authChannel === "local") return true;
+		if (environmentCredential(model)) return true;
+		return this.#store.providers[model.provider] !== undefined;
 	}
 
-	identity(): Pick<CodexCredentials, "accountId" | "email" | "expiresAt"> | undefined {
-		if (!this.#credentials) return undefined;
-		const { accountId, email, expiresAt } = this.#credentials;
-		return { ...(accountId ? { accountId } : {}), ...(email ? { email } : {}), expiresAt };
+	authenticationLabel(model: Model): string {
+		if (model.authChannel === "local") return "local endpoint";
+		const environment = environmentCredential(model);
+		if (environment) return environment.source;
+		const credential = this.#store.providers[model.provider];
+		if (!credential) {
+			const envName =
+				model.apiKeyEnv ?? (model.api === "anthropic-messages" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY");
+			return `missing auth; run aaa auth login ${model.provider} or set ${envName}`;
+		}
+		if (credential.type === "api_key") return credential.label ?? "stored API key";
+		const identity = credential.email ?? credential.accountId ?? credential.orgName;
+		return `${identity ? `${identity} · ` : ""}OAuth${credential.expiresAt <= Date.now() ? " (refresh on use)" : ""}`;
+	}
+
+	identity(provider = "openai-codex"): Pick<StoredOAuthCredential, "accountId" | "email" | "expiresAt"> | undefined {
+		const credential = this.#store.providers[normalizeAuthProvider(provider)];
+		if (credential?.type !== "oauth") return undefined;
+		return {
+			...(credential.accountId ? { accountId: credential.accountId } : {}),
+			...(credential.email ? { email: credential.email } : {}),
+			expiresAt: credential.expiresAt,
+		};
+	}
+
+	async #refresh(
+		provider: string,
+		credential: StoredOAuthCredential,
+		signal?: AbortSignal,
+	): Promise<StoredOAuthCredential> {
+		const active = this.#refreshing.get(provider);
+		if (active) return active;
+		const refresh = (async (): Promise<StoredOAuthCredential> => {
+			let next: StoredOAuthCredential;
+			if (provider === "openai-codex") {
+				if (!credential.refreshToken) throw new Error("OpenAI credential has no refresh token; log in again.");
+				const response = await requestOpenAITokens(
+					new URLSearchParams({
+						grant_type: "refresh_token",
+						client_id: CLIENT_ID,
+						refresh_token: credential.refreshToken,
+					}),
+					signal,
+				);
+				next = openAICredentialFromResponse(response, credential);
+			} else if (provider === "kimi-code") {
+				next = await refreshKimiCodeOAuth(credential, signal);
+			} else if (provider === "claude-code") {
+				next = await refreshClaudeCodeOAuth(credential, signal);
+			} else {
+				throw new Error(`OAuth refresh is not implemented for provider '${provider}'. Log in again.`);
+			}
+			this.#store.providers[provider] = next;
+			await saveCredentialStore(this.#store);
+			return next;
+		})();
+		this.#refreshing.set(provider, refresh);
+		try {
+			return await refresh;
+		} finally {
+			this.#refreshing.delete(provider);
+		}
+	}
+
+	async resolveCredential(
+		model: Model,
+		signal?: AbortSignal,
+		forceRefresh = false,
+	): Promise<ResolvedProviderCredential | undefined> {
+		if (model.authChannel === "local") return undefined;
+		const environment = environmentCredential(model);
+		if (environment) return environment;
+		const provider = model.provider;
+		let credential = this.#store.providers[provider];
+		if (!credential) return undefined;
+		if (credential.type === "oauth" && (forceRefresh || credential.expiresAt - REFRESH_MARGIN_MS <= Date.now())) {
+			credential = await this.#refresh(provider, credential, signal);
+		}
+		return resolvedStoredCredential(provider, credential);
 	}
 
 	async getAccessToken(signal?: AbortSignal, forceRefresh = false): Promise<string> {
-		const current = this.#credentials;
-		if (!current) throw new Error("Codex OAuth is not configured. Run 'aaa auth login' first.");
-		if (!forceRefresh && current.expiresAt - REFRESH_MARGIN_MS > Date.now()) return current.accessToken;
-		const response = await requestTokens(
-			new URLSearchParams({
-				grant_type: "refresh_token",
-				client_id: CLIENT_ID,
-				refresh_token: current.refreshToken,
-			}),
-			signal,
-		);
-		this.#credentials = credentialsFromResponse(response, current);
-		await saveCredentials(this.#credentials);
-		return this.#credentials.accessToken;
+		const model: Model = {
+			provider: "openai-codex",
+			id: "oauth",
+			name: "OpenAI Codex",
+			api: "codex-responses",
+			baseUrl: "https://chatgpt.com/backend-api",
+			contextWindow: 1,
+			efforts: ["minimal"],
+			authChannel: "subscription",
+		};
+		const credential = await this.resolveCredential(model, signal, forceRefresh);
+		if (!credential) throw new Error("Codex OAuth is not configured. Run 'aaa auth login openai-codex' first.");
+		return credential.secret;
 	}
 
 	close(): void {}
 }
 
-export async function openAdaptiveAuthSession(): Promise<CodexAuthSession> {
-	return new CodexAuthSession(await loadCredentials());
+/** Backwards-compatible constructor used by the public Codex adapter tests/SDK. */
+export class CodexAuthSession extends AdaptiveAuthSession {
+	constructor(credentials: CodexCredentials | undefined) {
+		const providers: CredentialStoreFile["providers"] = {};
+		if (credentials) {
+			providers["openai-codex"] = {
+				type: "oauth",
+				accessToken: credentials.accessToken,
+				refreshToken: credentials.refreshToken,
+				expiresAt: credentials.expiresAt,
+				...(credentials.accountId ? { accountId: credentials.accountId } : {}),
+				...(credentials.email ? { email: credentials.email } : {}),
+			};
+		}
+		super({ version: 2, providers });
+	}
+}
+
+export async function openAdaptiveAuthSession(): Promise<AdaptiveAuthSession> {
+	return new AdaptiveAuthSession(await loadCredentialStore());
 }
 
 export async function loginOpenAICodex(): Promise<void> {
 	const pkce = await createPkce();
 	const state = base64Url(crypto.getRandomValues(new Uint8Array(24)));
 	const authUrl = buildAuthorizationUrl({ state, codeChallenge: pkce.challenge });
-	const code = await waitForAuthorizationCode(state, authUrl);
-	const response = await requestTokens(
+	const code = await waitForOpenAIAuthorizationCode(state, authUrl);
+	const response = await requestOpenAITokens(
 		new URLSearchParams({
 			grant_type: "authorization_code",
 			client_id: CLIENT_ID,
@@ -268,27 +421,89 @@ export async function loginOpenAICodex(): Promise<void> {
 			code_verifier: pkce.verifier,
 		}),
 	);
-	const credentials = credentialsFromResponse(response);
-	await saveCredentials(credentials);
-	process.stdout.write(`Authenticated${credentials.email ? ` as ${credentials.email}` : ""}.\n`);
+	const credential = openAICredentialFromResponse(response);
+	await setStoredCredential("openai-codex", credential);
+	process.stdout.write(`Authenticated${credential.email ? ` as ${credential.email}` : ""}.\n`);
+}
+
+function printOAuthUrl(provider: string, url: string, instructions: string): void {
+	process.stdout.write(`\nOpen this official ${provider} URL in your browser:\n${url}\n${instructions}\n\n`);
+}
+
+export async function loginProviderOAuth(providerInput: string, signal?: AbortSignal): Promise<void> {
+	const provider = normalizeAuthProvider(providerInput);
+	if (provider === "openai-codex") return loginOpenAICodex();
+	let credential: StoredProviderCredential;
+	if (provider === "kimi-code") {
+		credential = await loginKimiCodeOAuth({
+			signal,
+			onAuthorization: (url, instructions) => printOAuthUrl("Kimi Code", url, instructions),
+			onProgress: message => process.stdout.write(`${message}\n`),
+		});
+	} else if (provider === "z-ai-coding") {
+		credential = await loginZaiCodingPlan({
+			signal,
+			onAuthorization: (url, instructions) => printOAuthUrl("Z.AI", url, instructions),
+			onProgress: message => process.stdout.write(`${message}\n`),
+		});
+	} else if (provider === "claude-code") {
+		credential = await loginClaudeCodeOAuth({
+			signal,
+			onAuthorization: (url, instructions) => printOAuthUrl("Claude", url, instructions),
+			onProgress: message => process.stdout.write(`${message}\n`),
+		});
+	} else {
+		throw new Error(`Provider '${providerInput}' does not support OAuth login; use 'aaa auth set-key ${provider}'.`);
+	}
+	await setStoredCredential(provider, credential);
+	process.stdout.write(`Authenticated ${provider}.\n`);
+}
+
+export async function setProviderApiKey(providerInput: string, apiKey: string): Promise<void> {
+	const provider = normalizeAuthProvider(providerInput);
+	const value = apiKey.trim();
+	if (!value) throw new Error("API key cannot be empty.");
+	await setStoredCredential(provider, { type: "api_key", apiKey: value, createdAt: Date.now() });
+}
+
+export async function describeStoredAuthentication(providerInput?: string): Promise<string> {
+	const store = await loadCredentialStore();
+	const providers = providerInput
+		? [normalizeAuthProvider(providerInput)]
+		: [...new Set([...AUTH_PROVIDERS.map(provider => provider.id), ...Object.keys(store.providers)])];
+	return providers
+		.map(provider => {
+			const definition = authProviderDefinition(provider);
+			const credential = store.providers[provider];
+			const envName = definition?.apiKeyEnv;
+			const envReady = envName ? Boolean(process.env[envName]?.trim()) : false;
+			let status = "not configured";
+			if (envReady) status = `environment ${envName}`;
+			else if (credential?.type === "api_key") status = credential.label ?? "stored API key";
+			else if (credential?.type === "oauth") {
+				const identity = credential.email ?? credential.accountId ?? credential.orgName;
+				status = `${identity ? `${identity}; ` : ""}OAuth expires ${new Date(credential.expiresAt).toISOString()}`;
+			}
+			return `${provider.padEnd(20)} ${status}`;
+		})
+		.join("\n");
 }
 
 export async function describeOpenAICodexAuth(): Promise<string> {
-	const credentials = await loadCredentials();
-	if (!credentials) return "not logged in";
-	const identity = credentials.email ?? credentials.accountId ?? "OpenAI account";
-	return `logged in as ${identity}; token expires ${new Date(credentials.expiresAt).toISOString()}`;
+	return describeStoredAuthentication("openai-codex");
+}
+
+export async function logoutProvider(providerInput: string): Promise<boolean> {
+	return removeStoredCredential(normalizeAuthProvider(providerInput));
+}
+
+export async function logoutAllProviders(): Promise<number> {
+	return clearStoredCredentials();
 }
 
 export async function logoutOpenAICodex(): Promise<void> {
-	try {
-		await fs.rm(getCredentialPath());
-		process.stdout.write("Removed AAA Agent OAuth credentials.\n");
-	} catch (error) {
-		if (error instanceof Error && "code" in error && error.code === "ENOENT") {
-			process.stdout.write("No AAA Agent OAuth credentials were stored.\n");
-			return;
-		}
-		throw error;
-	}
+	const removed = await logoutProvider("openai-codex");
+	process.stdout.write(
+		removed ? "Removed OpenAI Codex OAuth credentials.\n" : "No OpenAI Codex credentials were stored.\n",
+	);
 }

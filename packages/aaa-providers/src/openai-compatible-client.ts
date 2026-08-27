@@ -15,16 +15,26 @@ import {
 	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
+import type { ProviderCredentialResolver } from "./credential-store";
 import { runResponsesTransport, toolJsonSchema } from "./responses-transport";
 
 const MAX_ERROR_BODY = 2_000;
 
-function apiKeyFor(model: Model): string | undefined {
+async function apiKeyFor(
+	model: Model,
+	resolver?: ProviderCredentialResolver,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
 	if (model.authChannel === "local") return undefined;
+	const credential = await resolver?.resolveCredential(model, signal);
+	if (credential) return credential.secret;
 	const envName = model.apiKeyEnv ?? "OPENAI_API_KEY";
 	const apiKey = process.env[envName]?.trim();
-	if (!apiKey)
-		throw new Error(`Model '${model.provider}/${model.id}' requires API key environment variable ${envName}.`);
+	if (!apiKey) {
+		throw new Error(
+			`Model '${model.provider}/${model.id}' requires authentication. Run 'aaa auth login ${model.provider}' or set ${envName}.`,
+		);
+	}
 	return apiKey;
 }
 
@@ -280,12 +290,15 @@ async function runChatCompletions(options: AgentTurnOptions, apiKey: string | un
 	return { output, text, toolCalls, usage: chatUsage(options.model, payload.usage) };
 }
 
-export function createOpenAICompatibleProvider(model: Model): AgentTurnProvider {
-	const apiKey = apiKeyFor(model);
+export function createOpenAICompatibleProvider(model: Model, resolver?: ProviderCredentialResolver): AgentTurnProvider {
 	return {
 		provider: model.provider,
-		identity: model.authChannel === "local" ? "local endpoint" : (model.apiKeyEnv ?? "OPENAI_API_KEY"),
-		runTurn: options => {
+		identity:
+			model.authChannel === "local"
+				? "local endpoint"
+				: (resolver?.authenticationLabel(model) ?? model.apiKeyEnv ?? "OPENAI_API_KEY"),
+		async runTurn(options) {
+			const apiKey = await apiKeyFor(options.model, resolver, options.signal);
 			if (options.model.api === "openai-chat-completions") return runChatCompletions(options, apiKey);
 			return runResponsesTransport({
 				label: "OpenAI-compatible",

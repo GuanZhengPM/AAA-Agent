@@ -3,21 +3,26 @@
 import * as readline from "node:readline/promises";
 
 import {
+	type AdaptiveAuthSession,
 	assertModelSupportsServiceTier,
 	assertModelSupportsThinkingMode,
-	type CodexAuthSession,
+	authProviderDefinition,
 	createAdaptiveModelVariant,
 	createAgentTurnProvider,
-	describeOpenAICodexAuth,
+	describeStoredAuthentication,
+	listAuthProviders,
 	listModels,
-	loginOpenAICodex,
-	logoutOpenAICodex,
+	loginProviderOAuth,
+	logoutAllProviders,
+	logoutProvider,
 	modelAuthenticationReady,
+	normalizeAuthProvider,
 	openAdaptiveAuthSession,
 	resolveDefaultThinkingMode,
 	resolveSelectedModel,
 	resolveServiceTier,
 	setDefaultModel,
+	setProviderApiKey,
 	supportedThinkingModes,
 } from "@aaa-agent/providers";
 import {
@@ -66,7 +71,7 @@ Usage:
   aaa route [--model <id>] [--effort <mode>] [--tier <tier> | --fast] <task>
   aaa metrics [--json]
   aaa adaptive [status|on|off|reset]
-  aaa auth <login|status|logout>
+  aaa auth <providers|login|set-key|status|logout> [provider] [--api-key] [--stdin]
 
 No arguments starts a persistent interactive session. The run command remains
 available for scripts and reads the task from stdin when omitted.
@@ -111,6 +116,126 @@ function parseShellPolicy(value: string): ShellPolicy {
 	const policy = SHELL_POLICIES.find(candidate => candidate === value);
 	if (!policy) throw new Error(`Unknown shell policy '${value}'. Expected one of: ${SHELL_POLICIES.join(", ")}`);
 	return policy;
+}
+
+async function promptSecret(prompt: string): Promise<string> {
+	if (!process.stdin.isTTY || !process.stderr.isTTY || !process.stdin.setRawMode) {
+		throw new Error("A TTY is required for hidden API-key input. Pipe the key with --stdin instead.");
+	}
+	const input = process.stdin;
+	const wasRaw = input.isRaw;
+	const wasPaused = input.isPaused();
+	process.stderr.write(prompt);
+	input.setRawMode(true);
+	input.resume();
+	return new Promise<string>((resolve, reject) => {
+		let secret = "";
+		const cleanup = (): void => {
+			input.removeListener("data", onData);
+			input.removeListener("end", onEnd);
+			input.setRawMode(Boolean(wasRaw));
+			if (wasPaused) input.pause();
+			process.stderr.write("\n");
+		};
+		const finish = (): void => {
+			cleanup();
+			resolve(secret.trim());
+		};
+		const onEnd = (): void => {
+			cleanup();
+			reject(new Error("Terminal input closed before the API key was entered."));
+		};
+		const onData = (chunk: Buffer | string): void => {
+			for (const character of Buffer.isBuffer(chunk) ? chunk.toString("utf8") : chunk) {
+				if (character === "\r" || character === "\n") {
+					finish();
+					return;
+				}
+				if (character === "\u0003") {
+					cleanup();
+					reject(new Error("API-key input cancelled."));
+					return;
+				}
+				if (character === "\u007f" || character === "\b") secret = secret.slice(0, -1);
+				else if (character >= " ") secret += character;
+			}
+		};
+		input.on("data", onData);
+		input.once("end", onEnd);
+	});
+}
+
+async function readApiKey(fromStdin: boolean): Promise<string> {
+	const key = fromStdin ? (await Bun.stdin.text()).trim() : await promptSecret("API key (input hidden): ");
+	if (!key) throw new Error("API key cannot be empty.");
+	return key;
+}
+
+async function runAuthCommand(args: string[]): Promise<void> {
+	const [action = "status", ...rest] = args;
+	const fromStdin = rest.includes("--stdin");
+	const forceApiKey = rest.includes("--api-key");
+	const all = rest.includes("--all");
+	const unknownFlags = rest.filter(
+		value => value.startsWith("--") && !["--stdin", "--api-key", "--all"].includes(value),
+	);
+	if (unknownFlags.length > 0) throw new Error(`Unknown auth option '${unknownFlags[0]}'.`);
+	const positionals = rest.filter(value => !value.startsWith("--"));
+	if (positionals.length > 1) throw new Error("Authentication accepts at most one provider id.");
+	const providerInput = positionals[0];
+
+	if (action === "providers") {
+		if (rest.length > 0) throw new Error("Usage: aaa auth providers");
+		for (const provider of listAuthProviders()) {
+			process.stdout.write(
+				`${provider.id.padEnd(20)} ${provider.mode.padEnd(8)} ${provider.name}${provider.apiKeyEnv ? `  env=${provider.apiKeyEnv}` : ""}\n`,
+			);
+		}
+		return;
+	}
+	if (action === "status") {
+		if (fromStdin || forceApiKey || all) throw new Error("Usage: aaa auth status [provider]");
+		process.stdout.write(`${await describeStoredAuthentication(providerInput)}\n`);
+		return;
+	}
+	if (action === "logout") {
+		if (fromStdin || forceApiKey || (all && providerInput)) {
+			throw new Error("Usage: aaa auth logout [provider | --all]");
+		}
+		if (all) {
+			const count = await logoutAllProviders();
+			process.stdout.write(`Removed ${count} stored credential${count === 1 ? "" : "s"}.\n`);
+			return;
+		}
+		const provider = normalizeAuthProvider(providerInput ?? "openai-codex");
+		const removed = await logoutProvider(provider);
+		process.stdout.write(removed ? `Removed ${provider} credentials.\n` : `No stored ${provider} credentials.\n`);
+		return;
+	}
+	if (action !== "login" && action !== "set-key") {
+		throw new Error("Usage: aaa auth <providers|login|set-key|status|logout> [provider] [--api-key] [--stdin]");
+	}
+	const provider = normalizeAuthProvider(providerInput ?? (action === "login" ? "openai-codex" : ""));
+	if (!provider) throw new Error("Usage: aaa auth set-key <provider> [--stdin]");
+	const definition = authProviderDefinition(provider);
+	const useApiKey = action === "set-key" || forceApiKey || definition?.mode !== "oauth";
+	if (all) throw new Error("--all is only valid with 'aaa auth logout'.");
+	if (useApiKey) {
+		if (provider === "openai-codex") {
+			throw new Error(
+				"openai-codex requires browser OAuth; API keys belong to a separately configured OpenAI API model.",
+			);
+		}
+		if (provider === "claude-code") {
+			throw new Error("claude-code requires Claude OAuth; use provider 'anthropic' for an Anthropic API key.");
+		}
+		const apiKey = await readApiKey(fromStdin);
+		await setProviderApiKey(provider, apiKey);
+		process.stdout.write(`Stored API key for ${provider}.\n`);
+		return;
+	}
+	if (fromStdin) throw new Error("--stdin is only valid with API-key login (--api-key or set-key).");
+	await loginProviderOAuth(provider);
 }
 
 async function parseRunArguments(args: string[], allowStdin: boolean): Promise<RunArguments> {
@@ -284,7 +409,7 @@ function resolveRunServiceTier(
 
 async function resolveVerifierOptions(
 	modelId: string | undefined,
-	authSession: CodexAuthSession,
+	authSession: AdaptiveAuthSession,
 ): Promise<AdaptiveVerifierOptions | undefined> {
 	if (!modelId) return undefined;
 	const model = await resolveSelectedModel(modelId);
@@ -300,7 +425,7 @@ async function resolveVerifierOptions(
 
 async function resolveSubagentOptions(
 	modelId: string | undefined,
-	authSession: CodexAuthSession,
+	authSession: AdaptiveAuthSession,
 ): Promise<AdaptiveSubagentOptions | undefined> {
 	if (!modelId) return undefined;
 	const model = await resolveSelectedModel(modelId);
@@ -323,15 +448,8 @@ async function createRegistries() {
 	return { state, capabilities, overlays };
 }
 
-function authenticationLabel(model: Model, authSession: CodexAuthSession): string {
-	const channel = model.authChannel ?? (model.api === "codex-responses" ? "subscription" : "api_key");
-	if (channel === "subscription") {
-		const identity = authSession.identity();
-		return identity?.email ?? identity?.accountId ?? "Codex OAuth missing";
-	}
-	if (channel === "local") return "local endpoint";
-	const envName = model.apiKeyEnv ?? "OPENAI_API_KEY";
-	return process.env[envName]?.trim() ? `API key ${envName}` : `missing ${envName}`;
+function authenticationLabel(model: Model, authSession: AdaptiveAuthSession): string {
+	return authSession.authenticationLabel(model);
 }
 
 async function persistRun(
@@ -592,11 +710,7 @@ async function main(): Promise<void> {
 		return;
 	}
 	if (command === "auth") {
-		const [action] = args;
-		if (action === "login") await loginOpenAICodex();
-		else if (action === "status") process.stdout.write(`${await describeOpenAICodexAuth()}\n`);
-		else if (action === "logout") await logoutOpenAICodex();
-		else throw new Error("Usage: aaa auth <login|status|logout>");
+		await runAuthCommand(args);
 		return;
 	}
 	if (command === "models") {

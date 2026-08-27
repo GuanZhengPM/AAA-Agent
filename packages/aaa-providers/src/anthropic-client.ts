@@ -15,34 +15,74 @@ import {
 	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
+import type { ProviderCredentialResolver, ResolvedProviderCredential } from "./credential-store";
+import { kimiCodeHeaders } from "./oauth-kimi";
 import { toolJsonSchema } from "./responses-transport";
 
 const MAX_ERROR_BODY = 2_000;
 const ANTHROPIC_VERSION = "2023-06-01";
 const EFFORT_BETA = "effort-2025-11-24";
 const FAST_MODE_BETA = "fast-mode-2026-02-01";
+const CLAUDE_CODE_BETAS = ["claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14"];
 
-function apiKeyFor(model: Model): string {
+async function credentialFor(
+	model: Model,
+	resolver?: ProviderCredentialResolver,
+	signal?: AbortSignal,
+	forceRefresh = false,
+): Promise<ResolvedProviderCredential> {
+	const credential = await resolver?.resolveCredential(model, signal, forceRefresh);
+	if (credential) return credential;
 	const envName = model.apiKeyEnv ?? "ANTHROPIC_API_KEY";
-	const apiKey = process.env[envName]?.trim();
-	if (!apiKey)
-		throw new Error(`Model '${model.provider}/${model.id}' requires API key environment variable ${envName}.`);
-	return apiKey;
+	const secret = process.env[envName]?.trim();
+	if (!secret) {
+		throw new Error(
+			`Model '${model.provider}/${model.id}' requires authentication. Run 'aaa auth login ${model.provider}' or set ${envName}.`,
+		);
+	}
+	return {
+		provider: model.provider,
+		kind: model.provider === "claude-code" ? "oauth" : "api_key",
+		secret,
+		source: `environment ${envName}`,
+	};
 }
 
-function anthropicHeaders(model: Model, apiKey: string, fastMode: boolean): Headers {
+function anthropicHeaders(
+	model: Model,
+	credential: ResolvedProviderCredential,
+	fastMode: boolean,
+	sessionId?: string,
+): Headers {
+	const oauth = credential.kind === "oauth";
 	const headers = new Headers({
 		accept: "application/json",
 		"anthropic-version": ANTHROPIC_VERSION,
 		"content-type": "application/json",
-		"User-Agent": "aaa-agent/0.4.0",
+		"User-Agent": "AAA-Agent/0.4.0",
+		...(sessionId ? { "x-client-request-id": sessionId } : {}),
+		...(model.provider === "kimi-code" ? kimiCodeHeaders() : {}),
 	});
-	const betas: string[] = [];
+	const betas: string[] = oauth && model.provider === "claude-code" ? [...CLAUDE_CODE_BETAS] : [];
 	if (model.effortFormat === "anthropic_output_config") betas.push(EFFORT_BETA);
 	if (fastMode) betas.push(FAST_MODE_BETA);
-	if (betas.length > 0) headers.set("anthropic-beta", betas.join(","));
-	if (model.apiKeyHeader === "bearer") headers.set("Authorization", `Bearer ${apiKey}`);
-	else headers.set("x-api-key", apiKey);
+	if (betas.length > 0) headers.set("anthropic-beta", [...new Set(betas)].join(","));
+	if (oauth && model.provider === "claude-code") {
+		headers.set("User-Agent", "claude-cli/2.1.220 (external, aaa-agent)");
+		headers.set("anthropic-dangerous-direct-browser-access", "true");
+		headers.set("x-app", "cli");
+		headers.set("X-Stainless-Arch", process.arch === "arm64" ? "arm64" : "x64");
+		headers.set("X-Stainless-Lang", "js");
+		headers.set("X-Stainless-OS", process.platform);
+		headers.set("X-Stainless-Package-Version", "0.94.0");
+		headers.set("X-Stainless-Retry-Count", "0");
+		headers.set("X-Stainless-Runtime", "bun");
+		headers.set("X-Stainless-Runtime-Version", Bun.version);
+		headers.set("X-Stainless-Timeout", "600");
+		if (sessionId) headers.set("X-Claude-Code-Session-Id", sessionId);
+	}
+	if (oauth || model.apiKeyHeader === "bearer") headers.set("Authorization", `Bearer ${credential.secret}`);
+	else headers.set("x-api-key", credential.secret);
 	return headers;
 }
 
@@ -152,14 +192,17 @@ function isFastModeUnsupported(response: Response, body: string): boolean {
 	return response.status === 429 && /fast mode/i.test(body);
 }
 
-async function runAnthropicTurn(options: AgentTurnOptions, apiKey: string): Promise<AgentTurnResult> {
+async function runAnthropicTurn(
+	options: AgentTurnOptions,
+	credential: ResolvedProviderCredential,
+): Promise<AgentTurnResult> {
 	const url = `${resolveModelBaseUrl(options.model)}/v1/messages`;
 	const request = requestBody(options);
 	let fastMode = options.serviceTier === "priority";
 	const send = (): Promise<Response> =>
 		fetch(url, {
 			method: "POST",
-			headers: anthropicHeaders(options.model, apiKey, fastMode),
+			headers: anthropicHeaders(options.model, credential, fastMode, options.sessionId),
 			body: JSON.stringify(request),
 			signal: createProviderAttemptSignal(options.signal),
 		});
@@ -209,11 +252,26 @@ async function runAnthropicTurn(options: AgentTurnOptions, apiKey: string): Prom
 	return { output, text, toolCalls, usage: anthropicUsage(options.model, payload.usage) };
 }
 
-export function createAnthropicProvider(model: Model): AgentTurnProvider {
-	const apiKey = apiKeyFor(model);
+export function createAnthropicProvider(model: Model, resolver?: ProviderCredentialResolver): AgentTurnProvider {
 	return {
 		provider: model.provider,
-		identity: model.apiKeyEnv ?? "ANTHROPIC_API_KEY",
-		runTurn: options => runAnthropicTurn(options, apiKey),
+		identity: resolver?.authenticationLabel(model) ?? model.apiKeyEnv ?? "ANTHROPIC_API_KEY",
+		async runTurn(options) {
+			let credential = await credentialFor(options.model, resolver, options.signal);
+			try {
+				return await runAnthropicTurn(options, credential);
+			} catch (error) {
+				if (
+					!(error instanceof ProviderHttpError) ||
+					error.status !== 401 ||
+					credential.kind !== "oauth" ||
+					!resolver
+				) {
+					throw error;
+				}
+				credential = await credentialFor(options.model, resolver, options.signal, true);
+				return runAnthropicTurn(options, credential);
+			}
+		},
 	};
 }
