@@ -78,6 +78,7 @@ export function createDefaultCapabilityProfile(
 		confidence,
 		positiveEvidence,
 		negativeEvidence,
+		coldStart: true,
 		samples: 0,
 		updatedAt: Date.now(),
 	};
@@ -104,6 +105,7 @@ export class ModelCapabilityRegistry {
 		const normalized = structuredClone(profile);
 		normalized.taskSlice ??= "global";
 		normalized.samples = Math.max(0, normalized.samples);
+		normalized.coldStart = normalized.samples === 0;
 		normalized.observationWeights ??= {};
 		normalized.confidence ??= {};
 		normalized.positiveEvidence ??= {};
@@ -180,6 +182,7 @@ export class ModelCapabilityRegistry {
 			}
 		}
 		current.samples += weight;
+		current.coldStart = current.samples === 0;
 		current.updatedAt = observation.observedAt ?? Date.now();
 		this.#profiles.set(key, structuredClone(current));
 		return this.resolve(variant, taskSlice);

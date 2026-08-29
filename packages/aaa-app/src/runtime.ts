@@ -15,6 +15,7 @@ import {
 	Effort,
 	type Effort as EffortType,
 	type EvidenceRef,
+	type ExecutionLane,
 	extractLedgerEntries,
 	inferTaskFeatures,
 	isRecord,
@@ -22,6 +23,7 @@ import {
 	type Model,
 	type ModelCapabilityRegistry,
 	mergeLedger,
+	type PermissionMode,
 	type PrimaryExecutionContext,
 	pendingDeliverables,
 	resolveHistoryWorkingBudget,
@@ -30,11 +32,13 @@ import {
 	type StructuredContextState,
 	type SubagentResult,
 	type SubagentTask,
+	type TaskFeatureHints,
 	type ThinkingMode,
 	trimConversationKeepingPrefix,
 	type UsageMetrics,
 	type VerificationAssurance,
 	type VerificationResult,
+	type VerificationStrength,
 } from "@aaa-agent/runtime";
 import {
 	createAdaptiveToolset,
@@ -91,6 +95,9 @@ export interface RunAdaptiveTaskOptions {
 	verifier?: AdaptiveVerifierOptions;
 	/** Optional cheaper/faster model for read-only delegated work. */
 	subagent?: AdaptiveSubagentOptions;
+	permissionOverride?: PermissionMode;
+	laneOverride?: ExecutionLane;
+	verificationOverride?: VerificationStrength;
 	additionalTools?: readonly AgentTool[];
 	checkpoint?: LongRunCheckpoint;
 	onCheckpoint?: (checkpoint: LongRunCheckpoint) => void | Promise<void>;
@@ -232,15 +239,13 @@ function createPrimarySystemPrompt(context: PrimaryExecutionContext): string {
 		lane: context.policy.lane,
 		goalLevel: context.policy.goalLevel,
 		verification: context.policy.verification,
+		permissions: context.policy.permissions,
 		thinkingMode: context.policy.disableReasoning ? "off" : context.policy.reasoningEffort,
 		toolBudget: context.policy.toolBudget,
 		maxTurns: context.policy.budget.maxTurns,
 		servicePlan: context.model.servicePlan,
 		quotaBacked: context.model.servicePlan === "coding-plan" || context.model.servicePlan === "token-plan",
 		platform: process.platform,
-
-		round: context.round,
-		maxRounds: context.maxRounds,
 	});
 }
 
@@ -601,6 +606,10 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 	const additionalTools = [...(options.additionalTools ?? [])];
 	const primaryMinimalTools = [...toolset.minimalTools, ...additionalTools];
 	const primaryAllTools = [...toolset.allTools, ...additionalTools];
+	const primaryReadonlyTools = [
+		...toolset.readonlyTools,
+		...additionalTools.filter(tool => tool.sideEffect === "none"),
+	];
 	const signal = options.signal ?? new AbortController().signal;
 	const verificationChecks = new Map<string, VerificationCheck>();
 	const observedAcceptances: ObservedAcceptance[] = [];
@@ -745,8 +754,13 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						artifacts: context.artifacts,
 						contextState: context.contextState,
 					}),
-					tools: context.policy.toolSurface === "minimal" ? primaryMinimalTools : primaryAllTools,
-					escalationTools: primaryAllTools,
+					tools:
+						context.policy.permissions === "read-only"
+							? primaryReadonlyTools
+							: context.policy.toolSurface === "minimal"
+								? primaryMinimalTools
+								: primaryAllTools,
+					escalationTools: context.policy.permissions === "read-only" ? primaryReadonlyTools : primaryAllTools,
 					policy: {
 						reasoningEffort: context.policy.reasoningEffort,
 						...(context.policy.disableReasoning ? { disableReasoning: true } : {}),
@@ -994,13 +1008,22 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 		},
 	});
 
-	const features = inferTaskFeatures(options.task, {
+	const featureHints: TaskFeatureHints = {
 		contextTokens: Math.ceil(options.task.length / 1.5),
-	});
+		...(options.permissionOverride === "read-only" ? { readOnly: true, writesWorkspace: false } : {}),
+		...(options.permissionOverride === "write" ? { readOnly: false } : {}),
+	};
+	const features = inferTaskFeatures(options.task, featureHints);
 	const subagentTasks = features.userRequestedParallel ? deriveSubagentTasks(options.task) : undefined;
 	const result = await harness.run({
 		task: options.task,
 		model: variant,
+		featureHints: features,
+		routeOverrides: {
+			...(options.laneOverride ? { lane: options.laneOverride } : {}),
+			...(options.verificationOverride ? { verification: options.verificationOverride } : {}),
+			...(options.permissionOverride ? { permissions: options.permissionOverride } : {}),
+		},
 		subagentTasks,
 		contextState: effectiveContextState,
 		checkpoint: options.checkpoint,

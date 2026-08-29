@@ -5,6 +5,7 @@ import type {
 	ModelCapabilityProfile,
 	ModelVariant,
 	RouteDecision,
+	RouteOverrides,
 	TaskFeatureHints,
 	TaskFeatures,
 	TaskSlice,
@@ -30,9 +31,15 @@ const RESEARCH_PATTERN = /\b(research|compare|survey|investigate|evidence|source
 const GUI_PATTERN = /\b(gui|browser|desktop|screenshot|visual|ui|ux)\b|界面|浏览器|桌面|截图|视觉/i;
 const DOCUMENT_PATTERN = /\b(document|pdf|slides?|spreadsheet|translate)\b|文档|论文|报告|幻灯片|表格|翻译/i;
 
-const MIN_ADAPTATION_CONFIDENCE = 0.5;
+const EXPLICIT_READ_ONLY_PATTERN =
+	/\b(?:read[- ]only|analysis only|inspect(?:ation)? only|for review only)\b|只(?:读|分析|看)|仅(?:分析|阅读|查看|了解)|(?:不要|不得|不能|别)(?:修改|编辑|写入|改动|动代码)/i;
+const QUESTION_TROUBLE_PATTERN =
+	/(?:为什么|为何|什么原因|怎么回事|how come|why (?:is|are|does|did|do|can't|cannot))[^。.!?\n]{0,48}(?:失败|错误|报错|异常|崩(?:溃|了)|挂了|不(?:工作|生效|行|起作用)|bug|broken|fail(?:s|ed|ure)?)/i;
+const REPAIR_REQUEST_PATTERN = /\b(?:fix|repair|resolve)\b|(?:修复|修一下|修好|解决|排查并处理)/i;
 const NEGATED_WRITE_PATTERN =
 	/\b(?:do not|don't|must not|never)\s+(?:implement|modify|edit|write|change|delete|remove)\b|(?:不得|不要|禁止|不准|无需)(?:修改|编辑|写入|改动|删除)|只读/gi;
+
+const MIN_ADAPTATION_CONFIDENCE = 0.5;
 const BASE_POLICY: Record<ExecutionLane, ExecutionPolicy> = {
 	direct: {
 		lane: "direct",
@@ -40,6 +47,7 @@ const BASE_POLICY: Record<ExecutionLane, ExecutionPolicy> = {
 		autoSubagents: "off",
 		verification: "none",
 		toolSurface: "minimal",
+		permissions: "write",
 		toolBudget: 6,
 		maxToolCalls: 12,
 		reasoningEffort: Effort.Low,
@@ -62,6 +70,7 @@ const BASE_POLICY: Record<ExecutionLane, ExecutionPolicy> = {
 		autoSubagents: "off",
 		verification: "targeted",
 		toolSurface: "standard",
+		permissions: "write",
 		toolBudget: 10,
 		maxToolCalls: 20,
 		reasoningEffort: Effort.Medium,
@@ -84,9 +93,10 @@ const BASE_POLICY: Record<ExecutionLane, ExecutionPolicy> = {
 		autoSubagents: "read-only",
 		verification: "strict",
 		toolSurface: "full",
+		permissions: "write",
 		toolBudget: 16,
-		reasoningEffort: Effort.High,
 		maxToolCalls: 32,
+		reasoningEffort: Effort.High,
 		maxRepeatedToolCalls: 2,
 		maxConsecutiveToolFailures: 3,
 		budget: {
@@ -108,17 +118,29 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 	const mentionedPaths = new Set(task.match(PATH_PATTERN) ?? []);
 	const multiStep = MULTI_STEP_PATTERN.test(task);
 	const multiFile = MULTI_FILE_PATTERN.test(task);
-	const writeIntent = WRITE_PATTERN.test(task.replace(NEGATED_WRITE_PATTERN, ""));
+	const negationStripped = task.replace(NEGATED_WRITE_PATTERN, "");
+	const writeIntent = WRITE_PATTERN.test(negationStripped);
 	const parallelIntent = PARALLEL_PATTERN.test(task.replace(NEGATED_PARALLEL_PATTERN, ""));
 	const estimatedSteps =
 		hints.estimatedSteps ?? Math.max(1, numberedSteps || (multiStep || task.length > 600 ? 3 : 1));
 	const estimatedFiles = hints.estimatedFiles ?? Math.max(1, mentionedPaths.size, multiFile ? 2 : 1);
+	// Read-only is a permission decision, not a difficulty signal: strong markers
+	// (explicit read-only phrasing, negated writes) or the absence of any mutation
+	// verb make the task read-only. A question about a symptom (why does delete
+	// fail?) is analysis even though it names a destructive verb, unless the user
+	// also asks for the repair.
+	const readOnly =
+		hints.readOnly ??
+		(EXPLICIT_READ_ONLY_PATTERN.test(task) ||
+			!writeIntent ||
+			(QUESTION_TROUBLE_PATTERN.test(task) && !REPAIR_REQUEST_PATTERN.test(negationStripped)));
 	return {
 		estimatedSteps,
 		estimatedFiles,
 		independentBranches: hints.independentBranches ?? (parallelIntent ? 2 : 1),
 		contextTokens: hints.contextTokens ?? 0,
-		writesWorkspace: hints.writesWorkspace ?? writeIntent,
+		writesWorkspace: hints.writesWorkspace ?? (writeIntent && !readOnly),
+		readOnly,
 		destructiveRisk: hints.destructiveRisk ?? (DESTRUCTIVE_PATTERN.test(task) ? 0.75 : 0.1),
 		requiresVerification: hints.requiresVerification ?? VERIFY_PATTERN.test(task),
 		requiresGoalDag: hints.requiresGoalDag ?? false,
@@ -167,10 +189,14 @@ export function routeTask(
 	overlay: AdaptivePolicyPatch = {},
 	appliedOverlays: string[] = [],
 	model?: ModelVariant,
+	overrides: RouteOverrides = {},
 ): RouteDecision {
 	const reasons: string[] = [];
 	let lane: ExecutionLane;
-	if (features.userRequestedParallel || features.independentBranches >= 2 || features.requiresGoalDag) {
+	if (overrides.lane) {
+		lane = overrides.lane;
+		reasons.push(`explicit lane override: ${overrides.lane}`);
+	} else if (features.userRequestedParallel || features.independentBranches >= 2 || features.requiresGoalDag) {
 		lane = "orchestrated";
 		reasons.push(
 			features.requiresGoalDag
@@ -231,6 +257,10 @@ export function routeTask(
 		base.verification = "targeted";
 		reasons.push("workspace writes require external verification");
 	}
+	if (features.readOnly) {
+		base.permissions = "read-only";
+		reasons.push("read-only task: mutation tools are withheld by the host");
+	}
 	if (profile.verificationReliability < 0.6 && features.writesWorkspace) {
 		base.verification = lane === "orchestrated" ? "strict" : "targeted";
 		reasons.push("external verification required for low verification reliability");
@@ -268,6 +298,21 @@ export function routeTask(
 	if ((features.writesWorkspace || features.requiresVerification) && policy.verification === "none") {
 		policy.verification = "targeted";
 		reasons.push("overlay cannot disable task-required verification");
+	}
+	if (features.readOnly && policy.permissions === "write") {
+		policy.permissions = "read-only";
+		reasons.push("overlay cannot grant mutation for a read-only task");
+	}
+	// Explicit human overrides land last: the user's own flags outrank both
+	// keyword inference and learned overlays. Allowing a user to downgrade
+	// verification or re-enable mutation is a deliberate, visible choice.
+	if (overrides.verification && policy.verification !== overrides.verification) {
+		policy.verification = overrides.verification;
+		reasons.push(`explicit verification override: ${overrides.verification}`);
+	}
+	if (overrides.permissions && policy.permissions !== overrides.permissions) {
+		policy.permissions = overrides.permissions;
+		reasons.push(`explicit permission override: ${overrides.permissions}`);
 	}
 	if (
 		!configuredEffort &&

@@ -31,17 +31,20 @@ import {
 	AdaptiveOverlayRegistry,
 	appendRunRecord,
 	createDefaultCapabilityProfile,
+	type ExecutionLane,
 	inferTaskFeatures,
 	inferTaskSlice,
 	loadAdaptiveHarnessState,
 	type Model,
 	ModelCapabilityRegistry,
+	type PermissionMode,
 	routeTask,
 	SERVICE_TIERS,
 	type ServiceTier,
 	saveAdaptiveHarnessState,
 	THINKING_MODES,
 	type ThinkingMode,
+	type VerificationStrength,
 } from "@aaa-agent/runtime";
 import type { ShellApprovalRequest } from "@aaa-agent/workspace";
 import { createHistorySearchTool } from "./history-tool";
@@ -93,6 +96,9 @@ interface RunArguments {
 	task: string;
 	verbose: boolean;
 	shellPolicy: ShellPolicy;
+	permissionOverride?: PermissionMode;
+	laneOverride?: ExecutionLane;
+	verificationOverride?: VerificationStrength;
 }
 
 interface SessionArguments extends Omit<RunArguments, "task" | "verbose" | "shellPolicy"> {
@@ -116,6 +122,21 @@ function parseShellPolicy(value: string): ShellPolicy {
 	const policy = SHELL_POLICIES.find(candidate => candidate === value);
 	if (!policy) throw new Error(`Unknown shell policy '${value}'. Expected one of: ${SHELL_POLICIES.join(", ")}`);
 	return policy;
+}
+
+function parsePermissionOverride(readOnly: boolean, allowWrite: boolean): PermissionMode | undefined {
+	if (readOnly && allowWrite) throw new Error("--read-only and --allow-write cannot be used together.");
+	return readOnly ? "read-only" : allowWrite ? "write" : undefined;
+}
+
+function parseLane(value: string): ExecutionLane {
+	if (value === "direct" || value === "guided" || value === "orchestrated") return value;
+	throw new Error(`Unknown lane '${value}'. Expected direct, guided, or orchestrated.`);
+}
+
+function parseVerificationStrength(value: string): VerificationStrength {
+	if (value === "none" || value === "targeted" || value === "strict") return value;
+	throw new Error(`Unknown verification '${value}'. Expected none, targeted, or strict.`);
 }
 
 async function promptSecret(prompt: string): Promise<string> {
@@ -247,6 +268,10 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 	let cwd = process.cwd();
 	let verbose = false;
 	let shellPolicy: ShellPolicy = "deny";
+	let readOnlyFlag = false;
+	let allowWriteFlag = false;
+	let laneOverride: ExecutionLane | undefined;
+	let verificationOverride: VerificationStrength | undefined;
 	const taskParts: string[] = [];
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
@@ -296,6 +321,26 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 			shellPolicy = parseShellPolicy(value);
 			continue;
 		}
+		if (arg === "--read-only") {
+			readOnlyFlag = true;
+			continue;
+		}
+		if (arg === "--allow-write") {
+			allowWriteFlag = true;
+			continue;
+		}
+		if (arg === "--lane") {
+			const value = args[++index];
+			if (!value) throw new Error("--lane requires a value");
+			laneOverride = parseLane(value);
+			continue;
+		}
+		if (arg === "--verification") {
+			const value = args[++index];
+			if (!value) throw new Error("--verification requires a value");
+			verificationOverride = parseVerificationStrength(value);
+			continue;
+		}
 		if (arg === "--verbose") {
 			verbose = true;
 			continue;
@@ -306,6 +351,7 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 	let task = taskParts.join(" ").trim();
 	if (!task && allowStdin && !process.stdin.isTTY) task = (await Bun.stdin.text()).trim();
 	if (!task) throw new Error("A task is required. Pass it as arguments or pipe it on stdin.");
+	const permissionOverride = parsePermissionOverride(readOnlyFlag, allowWriteFlag);
 	return {
 		...(modelId ? { modelId } : {}),
 		...(verifierModelId ? { verifierModelId } : {}),
@@ -316,6 +362,9 @@ async function parseRunArguments(args: string[], allowStdin: boolean): Promise<R
 		task,
 		verbose,
 		shellPolicy,
+		...(permissionOverride ? { permissionOverride } : {}),
+		...(laneOverride ? { laneOverride } : {}),
+		...(verificationOverride ? { verificationOverride } : {}),
 	};
 }
 
@@ -477,14 +526,19 @@ async function persistRun(
 
 async function printModels(): Promise<void> {
 	const [selected, models] = await Promise.all([resolveSelectedModel(), listModels()]);
+	const state = await loadAdaptiveHarnessState();
+	const profileByVariant = new Map(state.profiles.map(profile => [profile.variantKey, profile]));
 	for (const model of models) {
 		const modes = supportedThinkingModes(model).join(",");
 		const tiers = model.serviceTiers?.join(",") || "standard";
 		const key = `${model.provider}/${model.id}`;
 		const marker = key === `${selected.provider}/${selected.id}` ? "*" : " ";
 		const plan = model.servicePlan ?? (model.authChannel === "subscription" ? "subscription" : "payg");
+		const profile = profileByVariant.get(key);
+		const evidence =
+			profile?.coldStart === false ? `samples=${profile.samples.toFixed(1)}` : "samples=0 (cold start; defaults)";
 		process.stdout.write(
-			`${marker} ${key.padEnd(40)} ${model.name}  plan=${plan}  api=${model.api}  context=${model.contextWindow}  thinking=${modes}  tiers=${tiers}\n`,
+			`${marker} ${key.padEnd(40)} ${model.name}  plan=${plan}  api=${model.api}  context=${model.contextWindow}  thinking=${modes}  tiers=${tiers}  ${evidence}\n`,
 		);
 	}
 }
@@ -512,12 +566,23 @@ async function previewRoute(args: string[]): Promise<void> {
 	const thinkingMode = resolveRunThinkingMode(model, parsed.thinkingMode, state.defaultThinkingMode);
 	const serviceTier = resolveRunServiceTier(model, parsed.serviceTier, state.defaultServiceTier);
 	const variant = createAdaptiveModelVariant(model, thinkingMode, serviceTier);
-	const features = inferTaskFeatures(parsed.task);
+	const features = inferTaskFeatures(
+		parsed.task,
+		parsed.permissionOverride === "read-only"
+			? { readOnly: true, writesWorkspace: false }
+			: parsed.permissionOverride === "write"
+				? { readOnly: false }
+				: {},
+	);
 	const profile = state.adaptiveEnabled
 		? capabilities.resolve(variant, inferTaskSlice(parsed.task, features))
 		: createDefaultCapabilityProfile(variant, {}, inferTaskSlice(parsed.task, features));
 	const resolved = state.adaptiveEnabled ? overlays.resolve(variant, profile) : { ids: [], policy: {} };
-	const decision = routeTask(features, profile, resolved.policy, resolved.ids, variant);
+	const decision = routeTask(features, profile, resolved.policy, resolved.ids, variant, {
+		...(parsed.laneOverride ? { lane: parsed.laneOverride } : {}),
+		...(parsed.verificationOverride ? { verification: parsed.verificationOverride } : {}),
+		...(parsed.permissionOverride ? { permissions: parsed.permissionOverride } : {}),
+	});
 	process.stdout.write(
 		`${JSON.stringify({ model: `${model.provider}/${model.id}`, features, profile, decision }, null, 2)}\n`,
 	);
@@ -571,6 +636,9 @@ async function runTask(args: string[]): Promise<void> {
 			...(serviceTier ? { serviceTier } : {}),
 			...(verifier ? { verifier } : {}),
 			...(subagent ? { subagent } : {}),
+			...(parsed.permissionOverride ? { permissionOverride: parsed.permissionOverride } : {}),
+			...(parsed.laneOverride ? { laneOverride: parsed.laneOverride } : {}),
+			...(parsed.verificationOverride ? { verificationOverride: parsed.verificationOverride } : {}),
 			capabilities,
 			overlays,
 			additionalTools: [createHistorySearchTool(parsed.cwd)],

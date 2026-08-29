@@ -370,6 +370,7 @@ it("persists the external long-run checkpoint with the interactive session", asy
 				independentBranches: 1,
 				contextTokens: 0,
 				writesWorkspace: true,
+				readOnly: false,
 				destructiveRisk: 0.1,
 				requiresVerification: true,
 				requiresGoalDag: false,

@@ -82,6 +82,7 @@ export type InteractiveAction =
 	| { type: "effort"; value?: string }
 	| { type: "tier"; value?: string }
 	| { type: "fast"; value?: string }
+	| { type: "mode"; value?: string }
 	| { type: "adaptive"; value?: string }
 	| { type: "status" }
 	| { type: "sessions" }
@@ -109,6 +110,7 @@ export interface InteractiveTaskRequest {
 	approveShell(request: ShellApprovalRequest): Promise<boolean>;
 	onCheckpoint(checkpoint: LongRunCheckpoint): void | Promise<void>;
 	adaptive: boolean;
+	permissionMode?: "read-only" | "write";
 	signal: AbortSignal;
 	onEvent(event: AdaptiveHarnessEvent): void;
 	onAgentEvent(event: AdaptiveRuntimeAgentEvent): void;
@@ -167,6 +169,8 @@ export function parseInteractiveInput(input: string): InteractiveAction {
 			return { type: "tier", ...optionalValue(value) };
 		case "fast":
 			return { type: "fast", ...optionalValue(value) };
+		case "mode":
+			return { type: "mode", ...optionalValue(value) };
 		case "status":
 		case "context":
 			return { type: "status" };
@@ -493,6 +497,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 	compactLiveHistory();
 	let showTools = true;
 	let verbose = false;
+	let permissionMode: "read-only" | "write" | undefined;
 	const sessionApprovedShellCommands = new Set<string>();
 	let adaptive = options.adaptive;
 	let pendingResume =
@@ -597,6 +602,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			);
 		}
 		write(`session    ${session.id} · ${session.status}`);
+		write(`permission ${permissionMode ?? "auto"}`);
 		if (session.pendingTask) write(`pending    ${session.pendingTask.replace(/\s+/g, " ").slice(0, 100)}`);
 		const authentication = options.authentication?.(model);
 		if (authentication) write(`auth       ${authentication}`);
@@ -643,6 +649,16 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			}
 			if (action.type === "unknown") {
 				write(`Unknown command '/${action.command}'. Use /help.`);
+				continue;
+			}
+			if (action.type === "mode") {
+				const value = action.value?.toLowerCase();
+				if (value !== "auto" && value !== "read-only" && value !== "write") {
+					write("Expected /mode auto, read-only, or write.");
+					continue;
+				}
+				permissionMode = value === "auto" ? undefined : value;
+				write(`Task permission mode: ${permissionMode ?? "auto"}.`);
 				continue;
 			}
 			if (action.type === "status") {
@@ -924,6 +940,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 					thinkingMode,
 					...(serviceTier ? { serviceTier } : {}),
 					cwd,
+					...(permissionMode ? { permissionMode } : {}),
 					conversation: session.digest?.text
 						? [
 								{

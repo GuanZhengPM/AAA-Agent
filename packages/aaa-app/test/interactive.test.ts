@@ -132,6 +132,15 @@ afterEach(async () => {
 	await Promise.all(tempDirectories.splice(0).map(directory => fs.rm(directory, { recursive: true, force: true })));
 });
 
+describe("interactive permission mode", () => {
+	it("parses /mode values", () => {
+		for (const value of ["read-only", "write", "auto"]) {
+			expect(parseInteractiveInput(`/mode ${value}`)).toEqual({ type: "mode", value });
+		}
+		expect(parseInteractiveInput("/mode")).toEqual({ type: "mode" });
+	});
+});
+
 describe("interactive model selection", () => {
 	it("accepts menu numbers, dotted numbers, full labels, names, ids, and provider-qualified ids", () => {
 		const models = [model, terraModel];
