@@ -59,6 +59,8 @@ const HELP = `Session commands:
   /effort               Select auto, off, or a native reasoning effort
   /tier                  Select a native service tier
   /fast <on|off>         Toggle priority/fast serving
+  /mode <auto|read-only|write>
+                         Control whether tasks may mutate the workspace
   /adaptive [status|on|off|reset]
                          Inspect or control local adaptation
   /status               Show model, workspace, context, and session

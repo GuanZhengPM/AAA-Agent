@@ -32,6 +32,7 @@ AAA Agent（`aaa`）是一个使用 Bun 和 TypeScript 开发的终端编程 Age
 
 - **自适应路由**：按任务范围选择 `direct`、`guided` 或 `orchestrated`；
 - **模型感知策略**：按模型能力调整推理、工具、重试和验证配置；
+- **宿主级权限控制**：自动识别只读任务，并从工具集中移除写入与 Shell 能力；
 - **受控并行**：主 Agent 负责写入，Subagent 只读；
 - **审计与验证**：完成状态必须绑定运行时证据；
 - **任务恢复**：长任务保存 checkpoint，可在中断后继续；
@@ -112,6 +113,8 @@ aaa models
 aaa use openai-codex/gpt-5.6-sol
 ```
 
+`aaa models` 会显示每个模型能力档案的观测样本数。`samples=0 (cold start; defaults)` 表示当前仍在使用默认能力值；产生真实任务证据后会显示累计样本数。
+
 也可以在 `~/.aaa-agent/models.json` 中添加 OpenAI Responses、OpenAI Chat Completions、Anthropic Messages 或本地 OpenAI-compatible 模型。自定义 Provider 可以通过模型配置中的 `apiKeyEnv` 读取环境变量，也可以运行 `aaa auth set-key <provider>` 写入独立凭据仓。
 
 一个最小的本地模型配置：
@@ -145,8 +148,20 @@ aaa
 aaa run "解释认证请求从 CLI 到 provider 的调用路径"
 aaa run --effort high "修复 parser 回归并运行相关测试"
 aaa run --subagent-model openai-codex/gpt-5.4-mini "并行检查三个独立模块"
+aaa run --read-only "分析认证流程，不要修改文件"
+aaa run --allow-write --lane guided --verification strict "修复认证回归并验证"
 cat task.txt | aaa run --cwd /path/to/project
 ```
+
+权限、路线和验证策略都可以显式覆盖自动推断：
+
+| 参数 | 可选值 | 用途 |
+| --- | --- | --- |
+| `--read-only` / `--allow-write` | 二选一 | 禁止或允许工作区修改 |
+| `--lane` | `direct`、`guided`、`orchestrated` | 覆盖自动选择的执行路线 |
+| `--verification` | `none`、`targeted`、`strict` | 覆盖验证强度 |
+
+这些参数同时适用于 `aaa run` 和 `aaa route`。显式参数优先于任务文本推断和自适应策略；`--read-only` 与 `--allow-write` 不能同时使用。
 
 只看路由结果，不发模型请求：
 
@@ -161,6 +176,7 @@ aaa route "检查认证和存储实现，并列出风险"
 | `/model [序号|名称|provider/id]` | 用上下键、序号、模型名称或完整 ID 切换模型 |
 | `/effort` | 选择推理强度或 `auto` |
 | `/tier`、`/fast` | 选择模型支持的服务层级 |
+| `/mode auto\|read-only\|write` | 自动推断、禁止写入或允许写入当前任务 |
 | `/status` | 查看模型、工作区、上下文和任务状态 |
 | `/sessions`、`/resume` | 查看或恢复会话 |
 | `/search <query>` | 搜索当前工作区的历史会话 |
@@ -176,6 +192,8 @@ aaa route "检查认证和存储实现，并列出风险"
 
 文件工具会拒绝工作区外的路径和越界符号链接。Shell 不同：它使用当前用户权限，理论上可以读取工作区外的文件。
 
+自动模式会把没有修改意图的解释、检查和分析请求识别为只读任务。只读权限由宿主强制执行：Primary Agent 只会获得 `read`、`glob`、`search` 以及其他无副作用工具，写入、编辑和 Shell 工具不会被提供。可在交互会话中使用 `/mode`，或在一次性任务中使用 `--read-only` / `--allow-write` 显式覆盖。
+
 因此：
 
 - 交互会话中，Agent 发起的 Shell 命令需要确认；输入 `a` 可仅对当前 session 中“同 cwd + 完全相同命令”复用授权；
@@ -190,6 +208,8 @@ aaa run --shell-policy allow "..."    # 全部允许，请谨慎使用
 ```
 
 macOS 的 sandbox 会限制写入和网络，但不是保密边界；不要把它当成“命令看不到工作区外文件”的保证。
+
+工作区 `glob` 和 `search` 默认忽略 `.git`、`node_modules`、`dist`、`build`、`.next`、`target`、`vendor` 和 `coverage`。文本搜索还会跳过二进制文件及超过 1 MiB 的文件，并拒绝超过 512 字符或语法无效的正则表达式。
 
 ### 它怎么工作
 
@@ -268,6 +288,7 @@ Key features:
 
 - **Adaptive routing**: selects `direct`, `guided`, or `orchestrated` from the task scope;
 - **Model-aware policy**: adjusts reasoning, tools, retries, and verification to the model;
+- **Host-enforced permissions**: detects read-only tasks and removes mutation and Shell capabilities from their toolset;
 - **Controlled parallelism**: the primary Agent writes; Subagents are read-only;
 - **Audit and verification**: completion must be backed by runtime evidence;
 - **Task recovery**: long-running tasks persist checkpoints and resume after interruption;
@@ -348,6 +369,8 @@ aaa models
 aaa use openai-codex/gpt-5.6-sol
 ```
 
+`aaa models` reports the observation count for each capability profile. `samples=0 (cold start; defaults)` means the profile still uses defaults; observed task evidence replaces that label with the accumulated sample count.
+
 Additional OpenAI Responses, OpenAI Chat Completions, Anthropic Messages, and local OpenAI-compatible models can be added in `~/.aaa-agent/models.json`. A custom provider may read `apiKeyEnv` or use a credential saved with `aaa auth set-key <provider>`.
 
 A minimal local model entry:
@@ -381,8 +404,20 @@ One-shot tasks:
 aaa run "Explain how authentication reaches the provider client"
 aaa run --effort high "Fix the parser regression and run the relevant test"
 aaa run --subagent-model openai-codex/gpt-5.4-mini "Inspect three independent modules in parallel"
+aaa run --read-only "Inspect the authentication flow without changing files"
+aaa run --allow-write --lane guided --verification strict "Fix and verify the authentication regression"
 cat task.txt | aaa run --cwd /path/to/project
 ```
+
+Permissions, routing, and verification can explicitly override automatic inference:
+
+| Option | Values | Purpose |
+| --- | --- | --- |
+| `--read-only` / `--allow-write` | mutually exclusive | Deny or allow workspace mutation |
+| `--lane` | `direct`, `guided`, `orchestrated` | Override the selected execution lane |
+| `--verification` | `none`, `targeted`, `strict` | Override verification strength |
+
+These options work with both `aaa run` and `aaa route`. Explicit options take precedence over task-text inference and adaptive policy; `--read-only` and `--allow-write` cannot be combined.
 
 Preview routing without making a model request:
 
@@ -397,6 +432,7 @@ Session commands:
 | `/model [number|name|provider/id]` | Select with arrow keys, a number, model name, or qualified ID |
 | `/effort` | Select a reasoning effort or `auto` |
 | `/tier`, `/fast` | Select a supported service tier |
+| `/mode auto\|read-only\|write` | Infer permissions, deny mutation, or allow mutation for tasks |
 | `/status` | Show model, workspace, context, and task state |
 | `/sessions`, `/resume` | List or resume sessions |
 | `/search <query>` | Search session history for the current workspace |
@@ -412,6 +448,8 @@ Session commands:
 
 File tools reject paths and symlinks that escape the workspace. Shell is different: it runs with the current user's permissions and may be able to read files outside the workspace.
 
+Auto mode classifies explanations, inspections, and analyses without mutation intent as read-only. The host enforces that permission: the primary Agent receives only `read`, `glob`, `search`, and other side-effect-free tools, while write, edit, and Shell tools are withheld. Use `/mode` in an interactive session or `--read-only` / `--allow-write` for a one-shot task to override inference.
+
 For that reason:
 
 - Agent-requested Shell commands require confirmation in interactive sessions; entering `a` reuses approval only for the exact same command and cwd in that session;
@@ -426,6 +464,8 @@ aaa run --shell-policy allow "..."    # allow all commands; use with care
 ```
 
 The macOS sandbox limits writes and network access, but it is not a confidentiality boundary. Do not assume a sandboxed command is unable to read outside the workspace.
+
+Workspace `glob` and `search` ignore `.git`, `node_modules`, `dist`, `build`, `.next`, `target`, `vendor`, and `coverage` by default. Text search also skips binary files and files larger than 1 MiB, and rejects regular expressions that are invalid or longer than 512 characters.
 
 ### How it is organized
 

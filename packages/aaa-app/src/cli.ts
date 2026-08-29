@@ -66,12 +66,12 @@ const HELP = `AAA Agent (3A Agent) — interactive, model-aware coding agent
 Usage:
   aaa
   aaa chat [--resume [id] | --new] [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--cwd <path>]
-  aaa run [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--shell-policy <deny|ask|sandbox|allow>] [--cwd <path>] [--verbose] <task>
+  aaa run [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--read-only | --allow-write] [--lane <direct|guided|orchestrated>] [--verification <none|targeted|strict>] [--shell-policy <deny|ask|sandbox|allow>] [--cwd <path>] [--verbose] <task>
   aaa sessions [query]
   aaa models
   aaa providers
   aaa use <provider/model-id>
-  aaa route [--model <id>] [--effort <mode>] [--tier <tier> | --fast] <task>
+  aaa route [--model <id>] [--effort <mode>] [--tier <tier> | --fast] [--read-only | --allow-write] [--lane <direct|guided|orchestrated>] [--verification <none|targeted|strict>] <task>
   aaa metrics [--json]
   aaa adaptive [status|on|off|reset]
   aaa auth <providers|login|set-key|status|logout> [provider] [--api-key] [--stdin]
@@ -728,6 +728,7 @@ async function startInteractive(args: string[]): Promise<void> {
 					approveShell: request.approveShell,
 					...(verifier ? { verifier } : {}),
 					...(subagent ? { subagent } : {}),
+					...(request.permissionMode ? { permissionOverride: request.permissionMode } : {}),
 					capabilities,
 					overlays,
 					additionalTools: [createHistorySearchTool(request.cwd)],

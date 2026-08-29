@@ -27,6 +27,9 @@
 - Added optional `--verifier-model` isolation, host-bound evidence ledgers, and verification assurance labels so model prose cannot fabricate completion evidence or silently train outcome capability scores.
 - Added bounded structured session context for durable goals, evidence-backed facts and artifacts, open risks, and recovery guidance beyond raw conversation retention.
 - Added explicit one-shot Shell policies (`deny`, `ask`, `sandbox`, and `allow`), with `deny` as the non-interactive default.
+- Added host-enforced `read-only` and `write` task permissions, automatic read-only intent detection, `--read-only` / `--allow-write` overrides, and interactive `/mode` control.
+- Added explicit `--lane` and `--verification` overrides for `aaa run` and `aaa route`; user-selected overrides take precedence over inferred and adaptive policy.
+- Added cold-start markers and observed sample counts to model capability profiles and `aaa models` output.
 - Added an AAA-owned, versioned multi-provider credential store with hidden API-key input, environment overrides, per-provider status/logout, and migration from the legacy Codex-only credential file.
 - Added direct official OAuth flows for Kimi Code, GLM Coding Plan, and Claude Code alongside Codex OAuth; browser flows return to AAA's localhost callback and never route through a pi URL.
 - Added bundled Claude Code subscription variants and persistent API-key login for DeepSeek, Z.AI, Moonshot/Kimi, Anthropic, OpenRouter, xAI, MiniMax, MiMo, and custom providers.
@@ -49,6 +52,7 @@
 - Made turn, tool-call, output-token, and total-token limits hard runtime ceilings while keeping large Shell output bounded.
 - Made token ceilings task-wide across Primary, Verifier, and Subagent sessions, capped each Verifier at 20% of the total, and limited automatic recovery to one repair before checkpointing.
 - Targeted verification now accepts a fresh deterministic check after the latest workspace mutation without starting another model session.
+- Workspace discovery now skips common dependency and build directories; text search also skips binary and oversized files and validates bounded regular expressions.
 - Provider clients now resolve credentials per request, refresh expiring Kimi/Claude/Codex OAuth grants, retry one OAuth 401 after refresh, and emit the provider-specific bearer, beta, and Kimi device headers.
 
 
@@ -79,3 +83,4 @@
 - Restricted workspace subprocess environments to an allowlist and made automatic verification checks fail closed when no supported OS sandbox is available.
 - Routed parallel work only from explicit imperative intent, respected negated parallel requests, and exposed parsed task features in `aaa route` output.
 - Persisted only explicit facts backed by independent verification or deterministic host evidence instead of promoting generic evidence summaries.
+- Forwarded interactive `/mode` selections into the runtime permission override so the displayed mode is enforced for subsequent tasks.
