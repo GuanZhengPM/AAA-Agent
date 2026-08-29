@@ -16,6 +16,40 @@ import writeDescription from "./prompts/tools/write.md" with { type: "text" };
 const MAX_TOOL_OUTPUT = 16_000;
 const MAX_LINE_LENGTH = 2_000;
 const MAX_SHELL_STREAM_CAPTURE = 7_500;
+const MAX_SEARCH_FILE_BYTES = 1_048_576;
+const MAX_SEARCH_PATTERN_LENGTH = 512;
+const IGNORED_SEARCH_SEGMENTS: Record<string, true> = {
+	".git": true,
+	node_modules: true,
+	dist: true,
+	build: true,
+	".next": true,
+	target: true,
+	vendor: true,
+	coverage: true,
+};
+
+function isIgnoredSearchPath(file: string): boolean {
+	return file.split(/[\\/]/).some(segment => IGNORED_SEARCH_SEGMENTS[segment] === true);
+}
+
+async function isSearchableFile(root: string, file: string): Promise<boolean> {
+	if (isIgnoredSearchPath(file)) return false;
+	try {
+		const handle = await fs.open(path.join(root, file), "r");
+		try {
+			const stat = await handle.stat();
+			if (stat.size > MAX_SEARCH_FILE_BYTES) return false;
+			const sample = Buffer.alloc(Math.min(8_192, stat.size));
+			const { bytesRead } = await handle.read(sample, 0, sample.byteLength, 0);
+			return !sample.subarray(0, bytesRead).includes(0);
+		} finally {
+			await handle.close();
+		}
+	} catch {
+		return false;
+	}
+}
 
 const SAFE_ENVIRONMENT_KEYS = new Set([
 	"APPDATA",
@@ -596,6 +630,7 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 			const params = globSchema.parse(rawParams);
 			const matches: string[] = [];
 			for await (const match of new Bun.Glob(params.pattern).scan({ cwd: root, dot: true, onlyFiles: true })) {
+				if (isIgnoredSearchPath(match)) continue;
 				matches.push(match);
 				if (matches.length >= (params.limit ?? 200)) break;
 			}
@@ -620,7 +655,15 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 		parameters: searchSchema,
 		execute: async (_toolCallId, rawParams) => {
 			const params = searchSchema.parse(rawParams);
-			const expression = new RegExp(params.pattern, params.caseSensitive === false ? "i" : "");
+			if (params.pattern.length > MAX_SEARCH_PATTERN_LENGTH) {
+				throw new Error(`Search pattern exceeds ${MAX_SEARCH_PATTERN_LENGTH} characters.`);
+			}
+			let expression: RegExp;
+			try {
+				expression = new RegExp(params.pattern, params.caseSensitive === false ? "i" : "");
+			} catch (error) {
+				throw new Error(`Invalid search pattern: ${error instanceof Error ? error.message : String(error)}`);
+			}
 			const matches: string[] = [];
 			const limit = params.limit ?? 200;
 			for await (const file of new Bun.Glob(params.files ?? "**/*").scan({
@@ -628,6 +671,7 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 				dot: true,
 				onlyFiles: true,
 			})) {
+				if (!(await isSearchableFile(root, file))) continue;
 				let text: string;
 				try {
 					text = await filesystem.readText(file);

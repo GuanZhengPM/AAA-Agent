@@ -70,10 +70,13 @@ past; search it.
 Lane: {{lane}}
 Goal mode: {{goalLevel}}
 Verification: {{verification}}
+Permissions: {{permissions}}
 Thinking mode: {{thinkingMode}}
 Tool-call budget: {{toolBudget}}
 Maximum turns: {{maxTurns}}
 Service plan: {{servicePlan}}
 Round: {{round}} of {{maxRounds}}
 Platform: {{platform}}
+
+When Permissions is read-only, the host has deliberately withheld all mutation and shell tools. Do not claim to have edited files; report the analysis and the exact missing capability instead.
 </execution-policy>

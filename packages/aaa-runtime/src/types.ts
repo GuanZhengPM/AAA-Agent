@@ -65,6 +65,8 @@ export type OverlayScope = "universal" | "family" | "model";
 export type VerificationStrength = "none" | "targeted" | "strict";
 export type AutoSubagentMode = "off" | "read-only" | "all";
 export type ToolSurface = "minimal" | "standard" | "full";
+/** Host-enforced mutation permission; orthogonal to the execution lane. */
+export type PermissionMode = "read-only" | "write";
 
 export interface ModelVariant {
 	key: string;
@@ -121,6 +123,8 @@ export interface ModelCapabilityProfile extends CapabilityScores {
 	confidence: Partial<Record<keyof CapabilityScores, number>>;
 	positiveEvidence: Partial<Record<keyof CapabilityScores, number>>;
 	negativeEvidence: Partial<Record<keyof CapabilityScores, number>>;
+	/** True until this exact profile has real observed task evidence. */
+	coldStart: boolean;
 	samples: number;
 	updatedAt: number;
 }
@@ -139,6 +143,8 @@ export interface TaskFeatures {
 	independentBranches: number;
 	contextTokens: number;
 	writesWorkspace: boolean;
+	/** True when the task must not mutate the workspace; enforced by the host, not prompts. */
+	readOnly: boolean;
 	destructiveRisk: number;
 	requiresVerification: boolean;
 	requiresGoalDag: boolean;
@@ -171,6 +177,8 @@ export interface ExecutionPolicy {
 	autoSubagents: AutoSubagentMode;
 	verification: VerificationStrength;
 	toolSurface: ToolSurface;
+	/** Mutation permission; the host refuses to hand mutation tools to read-only policies. */
+	permissions: PermissionMode;
 	toolBudget: number;
 	maxToolCalls: number;
 	reasoningEffort: Effort;
@@ -195,6 +203,7 @@ export interface AdaptivePolicyPatch {
 	autoSubagents?: AutoSubagentMode;
 	verification?: VerificationStrength;
 	toolSurface?: ToolSurface;
+	permissions?: PermissionMode;
 	toolBudget?: number;
 	reasoningEffort?: Effort;
 	maxRepeatedToolCalls?: number;
@@ -503,6 +512,8 @@ export interface AdaptiveHarnessRequest {
 	task: string;
 	model: ModelVariant;
 	featureHints?: TaskFeatureHints;
+	/** Explicit user overrides; they win over keyword inference and overlays. */
+	routeOverrides?: RouteOverrides;
 	goals?: AdaptiveGoalNode[];
 	subagentTasks?: SubagentTask[];
 	contextState?: StructuredContextState;
@@ -511,6 +522,12 @@ export interface AdaptiveHarnessRequest {
 	onCheckpoint?: (checkpoint: LongRunCheckpoint) => void | Promise<void>;
 	adaptive?: boolean;
 	signal?: AbortSignal;
+}
+
+export interface RouteOverrides {
+	lane?: ExecutionLane;
+	verification?: VerificationStrength;
+	permissions?: PermissionMode;
 }
 
 export interface AdaptiveHarnessResult {

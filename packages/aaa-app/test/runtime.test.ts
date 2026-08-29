@@ -1207,6 +1207,73 @@ describe("independent Codex identity", () => {
 		expect(result.audit?.summary).toContain("deterministic host check");
 	});
 
+	it("does not short-circuit on an unrelated passing test", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-unrelated-check-"));
+		tempDirectories.push(directory);
+		let verifierCalls = 0;
+		const model: Model = {
+			provider: "test",
+			id: "unrelated-check",
+			name: "Unrelated Check",
+			api: "openai-chat-completions",
+			baseUrl: "http://127.0.0.1",
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		const provider: AgentTurnProvider = {
+			provider: "test",
+			async runTurn(options) {
+				if (options.systemPrompt.includes("independent read-only verifier")) {
+					verifierCalls += 1;
+					return {
+						output: [],
+						text: JSON.stringify({
+							passed: false,
+							summary: "The check does not cover the requested billing change.",
+							completedGoalIds: [],
+							unmetCriteria: ["Relevant evidence required"],
+							evidence: [],
+							goalEvidence: [],
+						}),
+						toolCalls: [],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (options.tools.some(tool => tool.name === "write")) {
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "write",
+								name: "write",
+								arguments: '{"path":"billing.ts","content":"changed"}',
+							},
+						],
+						text: "",
+						toolCalls: [
+							{ callId: "write", name: "write", arguments: '{"path":"billing.ts","content":"changed"}' },
+						],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const result = await runAdaptiveTask({
+			task: "Fix the billing calculation and run its tests",
+			model,
+			provider,
+			cwd: directory,
+			reasoningConfig: Effort.Low,
+			approveShell: () => true,
+			capabilities: new ModelCapabilityRegistry(),
+			overlays: new AdaptiveOverlayRegistry(),
+		});
+		expect(verifierCalls).toBeGreaterThan(0);
+		expect(result.success).toBe(false);
+	});
+
 	it("shares one token ceiling across primary and verifier sessions", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-global-budget-"));
 		tempDirectories.push(directory);
@@ -1335,6 +1402,7 @@ describe("interactive terminal contracts", () => {
 					autoSubagents: "off",
 					verification: "none",
 					toolSurface: "minimal",
+					permissions: "write",
 					toolBudget: 6,
 					maxToolCalls: 12,
 					reasoningEffort: Effort.Low,
@@ -1429,6 +1497,19 @@ describe("adaptive model routing", () => {
 		expect(restored.resolve(variant).toolSchemaReliability).toBeGreaterThan(0.45);
 	});
 
+	it("marks unobserved model profiles as cold start and clears it after evidence", () => {
+		const registry = new ModelCapabilityRegistry();
+		const cold = registry.resolve(variant, "coding");
+		expect(cold.coldStart).toBe(true);
+		expect(cold.samples).toBe(0);
+		registry.observe(variant, {
+			taskSlice: "coding",
+			quality: "deterministic",
+			values: { toolSchemaReliability: 1 },
+		});
+		expect(registry.resolve(variant, "coding").coldStart).toBe(false);
+	});
+
 	it("keeps local work direct and escalates risk or parallelism", () => {
 		const profile = createDefaultCapabilityProfile(variant);
 		expect(routeTask(inferTaskFeatures("Explain this function"), profile).policy.lane).toBe("direct");
@@ -1452,6 +1533,36 @@ describe("adaptive model routing", () => {
 			reasoningEffort: Effort.Low,
 		}).policy;
 		expect(destructive.reasoningEffort).toBe(Effort.High);
+	});
+
+	it("classifies analysis questions as read-only and exposes permission as an orthogonal policy", () => {
+		const profile = createDefaultCapabilityProfile(variant);
+		const analysis = inferTaskFeatures("为什么删除用户失败？请分析原因，不要修改代码");
+		expect(analysis.readOnly).toBe(true);
+		expect(analysis.writesWorkspace).toBe(false);
+		expect(routeTask(analysis, profile).policy.permissions).toBe("read-only");
+		const implementation = inferTaskFeatures("修复登录错误并运行测试");
+		expect(implementation.readOnly).toBe(false);
+		expect(routeTask(implementation, profile).policy.permissions).toBe("write");
+	});
+
+	it("lets explicit route overrides win over inferred policy", () => {
+		const profile = createDefaultCapabilityProfile(variant);
+		const decision = routeTask(inferTaskFeatures("Explain this function"), profile, {}, [], variant, {
+			lane: "guided",
+			verification: "strict",
+			permissions: "write",
+		});
+		expect(decision.policy.lane).toBe("guided");
+		expect(decision.policy.verification).toBe("strict");
+		expect(decision.policy.permissions).toBe("write");
+		expect(decision.reasons).toEqual(
+			expect.arrayContaining([
+				"explicit lane override: guided",
+				"explicit verification override: strict",
+				"explicit permission override: write",
+			]),
+		);
 	});
 });
 
@@ -1782,10 +1893,49 @@ describe("structured context compression", () => {
 });
 
 describe("standalone workspace tools", () => {
+	it("withholds mutation tools and mutation escalation for read-only tasks", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-read-only-"));
+		tempDirectories.push(directory);
+		let requestedTools: string[] = [];
+		const provider: AgentTurnProvider = {
+			provider: "test",
+			async runTurn(options) {
+				requestedTools = options.tools.map(tool => tool.name);
+				return {
+					output: [],
+					text: "Analysis complete.",
+					toolCalls: [],
+					usage: createEmptyUsageMetrics(),
+				};
+			},
+		};
+		const model: Model = {
+			provider: "test",
+			id: "read-only",
+			name: "Read Only",
+			api: "openai-chat-completions",
+			baseUrl: "http://127.0.0.1",
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		const result = await runAdaptiveTask({
+			task: "分析这个目录，不要修改任何文件",
+			model,
+			provider,
+			cwd: directory,
+			reasoningConfig: Effort.Low,
+			capabilities: new ModelCapabilityRegistry(),
+			overlays: new AdaptiveOverlayRegistry(),
+		});
+		expect(result.route.policy.permissions).toBe("read-only");
+		expect(requestedTools).toEqual(["read", "glob", "search"]);
+	});
 	it("creates, reads, snapshot-edits, searches, and executes in the selected workspace", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-agent-"));
 		tempDirectories.push(directory);
 		const tools = createAdaptiveToolset(directory, { approveShell: () => true });
+
 		await toolNamed(tools.allTools, "write").execute("write", { path: "sample.txt", content: "before\n" });
 		const readResult = await toolNamed(tools.allTools, "read").execute("read", { path: "sample.txt" });
 		const readText = readResult.content[0]?.type === "text" ? readResult.content[0].text : "";
@@ -1838,6 +1988,7 @@ describe("standalone workspace tools", () => {
 			limit: 1,
 		});
 		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+
 		const hash = text.match(/\[sample\.txt#([0-9A-F]{12})\]/)?.[1];
 		expect(hash).toBeDefined();
 		await expect(
@@ -1847,6 +1998,22 @@ describe("standalone workspace tools", () => {
 				edits: [{ oldText: "hidden", newText: "changed" }],
 			}),
 		).rejects.toThrow("not shown by read");
+	});
+	it("bounds search scope and rejects unsafe patterns", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-search-guards-"));
+		tempDirectories.push(directory);
+		await fs.mkdir(path.join(directory, "node_modules"), { recursive: true });
+		await fs.mkdir(path.join(directory, "src"), { recursive: true });
+		await Bun.write(path.join(directory, "node_modules", "ignored.ts"), "needle");
+		await Bun.write(path.join(directory, "src", "kept.ts"), "needle");
+		const tools = createAdaptiveToolset(directory);
+		const result = await toolNamed(tools.allTools, "search").execute("search", { pattern: "needle" });
+		const text = result.content[0]?.type === "text" ? result.content[0].text : "";
+		expect(text).toContain("src/kept.ts:1:needle");
+		expect(text).not.toContain("node_modules/ignored.ts");
+		await expect(toolNamed(tools.allTools, "search").execute("search", { pattern: "x".repeat(513) })).rejects.toThrow(
+			"exceeds 512",
+		);
 	});
 
 	it("rejects a stale snapshot after an external write", async () => {

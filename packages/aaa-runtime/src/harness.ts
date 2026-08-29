@@ -172,7 +172,7 @@ export class AdaptiveHarness {
 			? structuredClone(resumed.policySnapshot.route)
 			: (() => {
 					const overlay = adaptive ? this.overlays.resolve(request.model, profile) : { ids: [], policy: {} };
-					return routeTask(features, profile, overlay.policy, overlay.ids, request.model);
+					return routeTask(features, profile, overlay.policy, overlay.ids, request.model, request.routeOverrides);
 				})();
 		this.#onEvent?.({ type: "routed", decision: route });
 		if (requestedSubagents.length > 0 && !this.#scheduler) {
