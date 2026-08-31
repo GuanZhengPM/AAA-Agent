@@ -63,7 +63,6 @@ function createRunDeadline(milliseconds: number): RunDeadline {
 	const timeoutReason = new Error("Harness deadline exceeded");
 	timeoutReason.name = "TimeoutError";
 	const timer = setTimeout(() => controller.abort(timeoutReason), milliseconds);
-	timer.unref();
 	return {
 		signal: controller.signal,
 		cancel() {
