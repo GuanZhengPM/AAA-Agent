@@ -33,8 +33,12 @@ jobs:
         run: bun test packages/aaa-app/test/auth.test.ts
       - name: Test interactive mode
         run: bun test packages/aaa-app/test/interactive.test.ts
-      - name: Test memory and retry behavior
-        run: bun test packages/aaa-app/test/memory-history.test.ts
+      - name: Test transcript durability
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "session transcript"
+      - name: Test context budgeting
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "rolling digest|context injection"
+      - name: Test provider retries
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "transient provider retry"
       - name: Test adaptive runtime
         run: bun test packages/aaa-app/test/runtime.test.ts
       - name: Test session storage
