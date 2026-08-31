@@ -11,6 +11,7 @@ import {
 	type Model,
 	ProviderHttpError,
 	providerErrorCode,
+	releaseProviderAttemptSignal,
 	resolveModelBaseUrl,
 	retryAfterMilliseconds,
 	type UsageMetrics,
@@ -235,59 +236,63 @@ async function runChatCompletions(options: AgentTurnOptions, apiKey: string | un
 	if (options.serviceTier) body.service_tier = options.serviceTier;
 	const url = `${resolveModelBaseUrl(options.model)}/chat/completions`;
 	const requestSignal = createProviderAttemptSignal(options.signal);
-	const response = await fetch(url, {
-		method: "POST",
-		headers: compatibleHeaders(apiKey, options.sessionId),
-		body: JSON.stringify(body),
-		signal: requestSignal,
-	});
-	if (!response.ok) {
-		const retryAfterMs = retryAfterMilliseconds(response);
-		const text = (await response.text()).slice(0, MAX_ERROR_BODY);
-		const providerCode = providerErrorCode(text);
-		const message = `OpenAI-compatible request failed (${response.status} ${response.statusText}): ${text}`;
-		throw new ProviderHttpError(message, {
-			status: response.status,
-			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-			...(providerCode ? { providerCode } : {}),
-			hardQuota: isHardQuotaFailure(message, providerCode),
+	try {
+		const response = await fetch(url, {
+			method: "POST",
+			headers: compatibleHeaders(apiKey, options.sessionId),
+			body: JSON.stringify(body),
+			signal: requestSignal,
 		});
-	}
-	if (response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
-		return await readChatCompletionStream(response, { ...options, signal: requestSignal });
-	}
-	const payload: unknown = await response.json();
-	if (!isRecord(payload) || !Array.isArray(payload.choices) || !isRecord(payload.choices[0])) {
-		throw new Error("OpenAI-compatible response did not contain a choice");
-	}
-	const choice = payload.choices[0];
-	if (!isRecord(choice.message)) throw new Error("OpenAI-compatible response did not contain an assistant message");
-	const message = choice.message;
-	const text = textFromContent(message.content);
-	const reasoningContent = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
-	if (text) options.onTextDelta?.(text);
-	const toolCalls: AgentFunctionCall[] = [];
-	const output: Record<string, unknown>[] = [];
-	if (text || reasoningContent) {
-		output.push({
-			type: "message",
-			role: "assistant",
-			content: text ? [{ type: "output_text", text }] : [],
-			...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
-		});
-	}
-	if (Array.isArray(message.tool_calls)) {
-		for (const rawCall of message.tool_calls) {
-			if (!isRecord(rawCall) || !isRecord(rawCall.function)) continue;
-			const callId = typeof rawCall.id === "string" ? rawCall.id : crypto.randomUUID();
-			const name = rawCall.function.name;
-			const argumentsValue = rawCall.function.arguments;
-			if (typeof name !== "string" || typeof argumentsValue !== "string") continue;
-			toolCalls.push({ callId, name, arguments: argumentsValue });
-			output.push({ type: "function_call", call_id: callId, name, arguments: argumentsValue });
+		if (!response.ok) {
+			const retryAfterMs = retryAfterMilliseconds(response);
+			const text = (await response.text()).slice(0, MAX_ERROR_BODY);
+			const providerCode = providerErrorCode(text);
+			const message = `OpenAI-compatible request failed (${response.status} ${response.statusText}): ${text}`;
+			throw new ProviderHttpError(message, {
+				status: response.status,
+				...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+				...(providerCode ? { providerCode } : {}),
+				hardQuota: isHardQuotaFailure(message, providerCode),
+			});
 		}
+		if (response.headers.get("content-type")?.toLowerCase().includes("text/event-stream")) {
+			return await readChatCompletionStream(response, { ...options, signal: requestSignal });
+		}
+		const payload: unknown = await response.json();
+		if (!isRecord(payload) || !Array.isArray(payload.choices) || !isRecord(payload.choices[0])) {
+			throw new Error("OpenAI-compatible response did not contain a choice");
+		}
+		const choice = payload.choices[0];
+		if (!isRecord(choice.message)) throw new Error("OpenAI-compatible response did not contain an assistant message");
+		const message = choice.message;
+		const text = textFromContent(message.content);
+		const reasoningContent = typeof message.reasoning_content === "string" ? message.reasoning_content : "";
+		if (text) options.onTextDelta?.(text);
+		const toolCalls: AgentFunctionCall[] = [];
+		const output: Record<string, unknown>[] = [];
+		if (text || reasoningContent) {
+			output.push({
+				type: "message",
+				role: "assistant",
+				content: text ? [{ type: "output_text", text }] : [],
+				...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+			});
+		}
+		if (Array.isArray(message.tool_calls)) {
+			for (const rawCall of message.tool_calls) {
+				if (!isRecord(rawCall) || !isRecord(rawCall.function)) continue;
+				const callId = typeof rawCall.id === "string" ? rawCall.id : crypto.randomUUID();
+				const name = rawCall.function.name;
+				const argumentsValue = rawCall.function.arguments;
+				if (typeof name !== "string" || typeof argumentsValue !== "string") continue;
+				toolCalls.push({ callId, name, arguments: argumentsValue });
+				output.push({ type: "function_call", call_id: callId, name, arguments: argumentsValue });
+			}
+		}
+		return { output, text, toolCalls, usage: chatUsage(options.model, payload.usage) };
+	} finally {
+		releaseProviderAttemptSignal(requestSignal);
 	}
-	return { output, text, toolCalls, usage: chatUsage(options.model, payload.usage) };
 }
 
 export function createOpenAICompatibleProvider(model: Model, resolver?: ProviderCredentialResolver): AgentTurnProvider {
