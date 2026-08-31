@@ -23,7 +23,27 @@ export function createProviderAttemptSignal(
 	timeoutMs = resolveProviderAttemptTimeoutMs(),
 ): AbortSignal {
 	if (parent.aborted) return parent;
-	return AbortSignal.any([parent, AbortSignal.timeout(timeoutMs)]);
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => {
+			controller.abort(new DOMException("Provider request timed out", "TimeoutError"));
+		},
+		Math.max(1, timeoutMs),
+	);
+	// A completed request must not keep the CLI alive until the attempt deadline,
+	// while an active network request/test runner still lets this timer fire.
+	timer.unref();
+	const onParentAbort = (): void => controller.abort(parent.reason);
+	parent.addEventListener("abort", onParentAbort, { once: true });
+	controller.signal.addEventListener(
+		"abort",
+		() => {
+			clearTimeout(timer);
+			parent.removeEventListener("abort", onParentAbort);
+		},
+		{ once: true },
+	);
+	return controller.signal;
 }
 
 /** Structured HTTP failure so retry policy does not have to scrape strings. */
