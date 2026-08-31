@@ -48,6 +48,7 @@ import {
 	type VerificationCheck,
 } from "@aaa-agent/workspace";
 import Handlebars from "handlebars";
+import { describeAcceptanceBinding, isAcceptanceBound } from "./acceptance-binding";
 import agentSystemTemplate from "./prompts/agent-system.md" with { type: "text" };
 import primaryRequestTemplate from "./prompts/primary-request.md" with { type: "text" };
 import subagentDiscoveryTemplate from "./prompts/subagent-discovery.md" with { type: "text" };
@@ -613,6 +614,8 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 	const signal = options.signal ?? new AbortController().signal;
 	const verificationChecks = new Map<string, VerificationCheck>();
 	const observedAcceptances: ObservedAcceptance[] = [];
+	// 宿主观察到被改动的文件。验收证据必须能绑定到这些文件，否则不承认"通过"。
+	const changedFiles = new Set<string>();
 	const affinityRoot = options.sessionId ?? crypto.randomUUID();
 	let globalMutationEpoch = 0;
 	let nextVerificationCheckId = 1;
@@ -793,6 +796,10 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 							const mutatedWorkspace =
 								(event.success && (started?.name === "write" || started?.name === "edit")) ||
 								(started?.name === "shell" && event.details?.workspaceMutationRisk !== "none");
+							if (event.success && (started?.name === "write" || started?.name === "edit")) {
+								const target = isRecord(started?.arguments) ? started?.arguments.path : undefined;
+								if (typeof target === "string" && target.length > 0) changedFiles.add(target);
+							}
 							if (mutatedWorkspace) {
 								globalMutationEpoch += 1;
 								for (const [command, check] of verificationChecks) {
@@ -862,13 +869,31 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 				const checks = [...verificationChecks.values()];
 				const currentChecks = checks.filter(check => check.current && check.primaryExitCode === 0);
 				const currentObserved = observedAcceptances.filter(item => item.mutationEpoch === globalMutationEpoch);
+				// 一条"通过"的检查只证明它自己退出码为 0。要作为确定性证据短路验收，
+				// 它还必须能绑定到本次真正改动过的文件，否则交由独立 verifier 判断。
+				const changedFileList = [...changedFiles];
+				const boundChecks = currentChecks.filter(check =>
+					isAcceptanceBound(check.command, changedFileList, context.task),
+				);
+				const boundObserved = currentObserved.filter(item =>
+					isAcceptanceBound(item.command, changedFileList, context.task),
+				);
+				const unboundCommands = [
+					...currentChecks.map(check => check.command),
+					...currentObserved.map(item => item.command),
+				].filter(command => !isAcceptanceBound(command, changedFileList, context.task));
+				const unboundEvidence: EvidenceRef[] = unboundCommands.map((command, index) => ({
+					kind: "test",
+					ref: `unbound-acceptance-${index}`,
+					summary: describeAcceptanceBinding(command, changedFileList, context.task),
+				}));
 				const deterministicEvidence = [
 					...(result.evidence ?? []).filter(
 						evidence =>
 							evidence.kind === "test" &&
-							currentChecks.some(check => evidence.summary?.includes(`target=${check.command}`)),
+							boundChecks.some(check => evidence.summary?.includes(`target=${check.command}`)),
 					),
-					...currentObserved.map(item => item.evidence),
+					...boundObserved.map(item => item.evidence),
 				].filter((evidence, index, all) => all.findIndex(item => item.ref === evidence.ref) === index);
 				const recordedAcceptance = checks
 					.map(check => check.command)
@@ -954,7 +979,7 @@ export async function runAdaptiveTask(options: RunAdaptiveTaskOptions): Promise<
 						output: compactFinding(result.output, 8_000),
 						goals: context.goals,
 						round: context.round,
-						evidence: result.evidence ?? [],
+						evidence: [...(result.evidence ?? []), ...unboundEvidence],
 						checks,
 					}),
 					tools: [

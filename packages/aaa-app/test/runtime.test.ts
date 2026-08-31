@@ -1210,7 +1210,15 @@ describe("independent Codex identity", () => {
 	it("does not short-circuit on an unrelated passing test", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-unrelated-check-"));
 		tempDirectories.push(directory);
+		// 一个与 billing 需求毫无关系、但必定通过的测试。此前的版本从未真正执行
+		// 任何检查命令，因此测的其实是"没有证据"而非"证据无关"。
+		await fs.writeFile(
+			path.join(directory, "unrelated.test.ts"),
+			'import { expect, test } from "bun:test";\ntest("unrelated sanity", () => { expect(1 + 1).toBe(2); });\n',
+			"utf8",
+		);
 		let verifierCalls = 0;
+		let primaryTurn = 0;
 		const model: Model = {
 			provider: "test",
 			id: "unrelated-check",
@@ -1240,20 +1248,36 @@ describe("independent Codex identity", () => {
 						usage: createEmptyUsageMetrics(),
 					};
 				}
-				if (options.tools.some(tool => tool.name === "write")) {
+				primaryTurn += 1;
+				if (primaryTurn === 1) {
+					const args = '{"path":"billing.ts","content":"changed"}';
 					return {
 						output: [
 							{
 								type: "function_call",
 								call_id: "write",
 								name: "write",
-								arguments: '{"path":"billing.ts","content":"changed"}',
+								arguments: args,
 							},
 						],
 						text: "",
-						toolCalls: [
-							{ callId: "write", name: "write", arguments: '{"path":"billing.ts","content":"changed"}' },
+						toolCalls: [{ callId: "write", name: "write", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (primaryTurn === 2) {
+					const args = JSON.stringify({ command: "bun test unrelated.test.ts" });
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "run-check",
+								name: "shell",
+								arguments: args,
+							},
 						],
+						text: "",
+						toolCalls: [{ callId: "run-check", name: "shell", arguments: args }],
 						usage: createEmptyUsageMetrics(),
 					};
 				}
@@ -1272,6 +1296,97 @@ describe("independent Codex identity", () => {
 		});
 		expect(verifierCalls).toBeGreaterThan(0);
 		expect(result.success).toBe(false);
+	});
+
+	it("short-circuits when a passing check is bound to the changed file", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-bound-check-"));
+		tempDirectories.push(directory);
+		// 与改动文件同名的测试：这次检查确实覆盖了改动，应当被接受。
+		await fs.writeFile(
+			path.join(directory, "billing.test.ts"),
+			'import { expect, test } from "bun:test";\ntest("billing", () => { expect(1 + 1).toBe(2); });\n',
+			"utf8",
+		);
+		let verifierCalls = 0;
+		let primaryTurn = 0;
+		const model: Model = {
+			provider: "test",
+			id: "bound-check",
+			name: "Bound Check",
+			api: "openai-chat-completions",
+			baseUrl: "http://127.0.0.1",
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		const provider: AgentTurnProvider = {
+			provider: "test",
+			async runTurn(options) {
+				if (options.systemPrompt.includes("independent read-only verifier")) {
+					verifierCalls += 1;
+					return {
+						output: [],
+						text: JSON.stringify({
+							passed: true,
+							summary: "Verifier reached, which should not happen for a bound check.",
+							completedGoalIds: [],
+							unmetCriteria: [],
+							evidence: [],
+							goalEvidence: [],
+						}),
+						toolCalls: [],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				primaryTurn += 1;
+				if (primaryTurn === 1) {
+					const args = '{"path":"billing.ts","content":"changed"}';
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "write",
+								name: "write",
+								arguments: args,
+							},
+						],
+						text: "",
+						toolCalls: [{ callId: "write", name: "write", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (primaryTurn === 2) {
+					const args = JSON.stringify({ command: "bun test billing.test.ts" });
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "run-check",
+								name: "shell",
+								arguments: args,
+							},
+						],
+						text: "",
+						toolCalls: [{ callId: "run-check", name: "shell", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const result = await runAdaptiveTask({
+			task: "Fix the billing calculation and run its tests",
+			model,
+			provider,
+			cwd: directory,
+			reasoningConfig: Effort.Low,
+			approveShell: () => true,
+			capabilities: new ModelCapabilityRegistry(),
+			overlays: new AdaptiveOverlayRegistry(),
+		});
+		expect(verifierCalls).toBe(0);
+		expect(result.success).toBe(true);
+		expect(result.audit?.assurance).toBe("deterministic");
 	});
 
 	it("shares one token ceiling across primary and verifier sessions", async () => {
