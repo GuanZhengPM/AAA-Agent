@@ -48,6 +48,6 @@ jobs:
       - name: Test session storage
         run: bun test packages/aaa-app/test/session-store.test.ts
       - name: Test goal and ledger control
-        run: bun test packages/aaa-runtime/test/*.test.ts
+        run: bun test packages/aaa-runtime/test
       - name: Test workspace tools
         run: bun test packages/aaa-workspace/test/tools.test.ts
