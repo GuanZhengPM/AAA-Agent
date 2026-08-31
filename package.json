@@ -15,7 +15,7 @@
 	"scripts": {
 		"aaa": "bun packages/aaa-app/src/cli.ts",
 		"check": "bun run --workspaces --if-present check",
-		"test": "bun test --parallel packages/aaa-workspace/test/*.test.ts packages/aaa-app/test/*.test.ts"
+		"test": "bun test --parallel packages/*/test/*.test.ts"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "^2.5.3",

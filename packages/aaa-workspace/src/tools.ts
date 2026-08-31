@@ -33,6 +33,86 @@ function isIgnoredSearchPath(file: string): boolean {
 	return file.split(/[\\/]/).some(segment => IGNORED_SEARCH_SEGMENTS[segment] === true);
 }
 
+interface RegexGroupState {
+	hasAlternation: boolean;
+	hasQuantifier: boolean;
+}
+
+function quantifierLength(pattern: string, index: number): number {
+	const character = pattern[index];
+	if (character === "*" || character === "+" || character === "?") return 1;
+	if (character !== "{") return 0;
+	const close = pattern.indexOf("}", index + 1);
+	if (close < 0) return 0;
+	return /^\{\d+(?:,\d*)?\}$/.test(pattern.slice(index, close + 1)) ? close - index + 1 : 0;
+}
+
+/**
+ * JavaScript RegExp has no execution timeout. Reject constructs with common
+ * exponential-backtracking shapes before they ever see workspace content.
+ * This is intentionally conservative: callers can split a complex expression
+ * into multiple safe searches instead of risking an uninterruptible tool call.
+ */
+function assertSafeSearchPattern(pattern: string): void {
+	if (pattern.length > MAX_SEARCH_PATTERN_LENGTH) {
+		throw new Error(`Search pattern exceeds ${MAX_SEARCH_PATTERN_LENGTH} characters.`);
+	}
+	const groups: RegexGroupState[] = [{ hasAlternation: false, hasQuantifier: false }];
+	let escaped = false;
+	let inCharacterClass = false;
+	let unboundedWildcards = 0;
+	for (let index = 0; index < pattern.length; index += 1) {
+		const character = pattern[index] ?? "";
+		if (escaped) {
+			if (!inCharacterClass && /[1-9]/.test(character)) {
+				throw new Error("Unsafe search pattern: backreferences are not allowed.");
+			}
+			escaped = false;
+			continue;
+		}
+		if (character === "\\") {
+			escaped = true;
+			continue;
+		}
+		if (character === "[" && !inCharacterClass) {
+			inCharacterClass = true;
+			continue;
+		}
+		if (character === "]" && inCharacterClass) {
+			inCharacterClass = false;
+			continue;
+		}
+		if (inCharacterClass) continue;
+		if (character === "(") {
+			groups.push({ hasAlternation: false, hasQuantifier: false });
+			continue;
+		}
+		if (character === "|") {
+			groups.at(-1)!.hasAlternation = true;
+			continue;
+		}
+		if (character === ")" && groups.length > 1) {
+			const group = groups.pop()!;
+			const quantified = quantifierLength(pattern, index + 1) > 0;
+			if (quantified && (group.hasQuantifier || group.hasAlternation)) {
+				throw new Error("Unsafe search pattern: nested or ambiguous repetition is not allowed.");
+			}
+			if (quantified) groups.at(-1)!.hasQuantifier = true;
+			continue;
+		}
+		const length = quantifierLength(pattern, index);
+		if (length > 0) {
+			// `?` immediately after `(` starts a lookaround/non-capturing group.
+			if (!(character === "?" && pattern[index - 1] === "(")) groups.at(-1)!.hasQuantifier = true;
+			if ((character === "*" || character === "+") && pattern[index - 1] === ".") unboundedWildcards += 1;
+			index += length - 1;
+		}
+	}
+	if (unboundedWildcards > 1) {
+		throw new Error("Unsafe search pattern: multiple unbounded wildcards are not allowed.");
+	}
+}
+
 async function isSearchableFile(root: string, file: string): Promise<boolean> {
 	if (isIgnoredSearchPath(file)) return false;
 	try {
@@ -655,9 +735,7 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 		parameters: searchSchema,
 		execute: async (_toolCallId, rawParams) => {
 			const params = searchSchema.parse(rawParams);
-			if (params.pattern.length > MAX_SEARCH_PATTERN_LENGTH) {
-				throw new Error(`Search pattern exceeds ${MAX_SEARCH_PATTERN_LENGTH} characters.`);
-			}
+			assertSafeSearchPattern(params.pattern);
 			let expression: RegExp;
 			try {
 				expression = new RegExp(params.pattern, params.caseSensitive === false ? "i" : "");

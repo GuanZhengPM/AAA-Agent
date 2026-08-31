@@ -42,12 +42,14 @@ import {
 	type HarnessCandidate,
 	type HarnessRunMetrics,
 	type HarnessRunRecord,
+	indexCapabilityProfilesByModel,
 	inferTaskFeatures,
 	inferTaskSlice,
 	type LongRunCheckpoint,
 	type Model,
 	ModelCapabilityRegistry,
 	mergeVerifiedFacts,
+	parseModelVariantKey,
 	resetProviderConcurrencyGates,
 	routeTask,
 	runAgentSession,
@@ -1054,14 +1056,14 @@ describe("independent Codex identity", () => {
 				primaryTurn += 1;
 				const call =
 					primaryTurn === 1
-						? { callId: "write-1", name: "write", arguments: '{"path":"result.txt","content":"fixed"}' }
+						? { callId: "write-1", name: "write", arguments: '{"path":"smoke.py","content":"fixed"}' }
 						: primaryTurn === 2
 							? {
 									callId: "check-1",
 									name: "shell",
 									arguments: JSON.stringify({
 										command:
-											"python3 -m unittest discover -s tests -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY",
+											"python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY",
 									}),
 								}
 							: undefined;
@@ -1117,7 +1119,7 @@ describe("independent Codex identity", () => {
 		expect(verifierCalls).toBe(0);
 		expect(result.audit?.assurance).toBe("deterministic");
 		expect(result.audit?.evidence[0]?.summary).toContain(
-			"python3 -m unittest discover -s tests -v && python3 - <<'PY'",
+			"python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'",
 		);
 		expect(result.audit?.evidence[0]?.summary).toContain("exitCode=0");
 	});
@@ -1579,6 +1581,28 @@ describe("adaptive model routing", () => {
 		expect(variant.endpoint).toBe("https://chatgpt.com/backend-api");
 	});
 
+	it("restores model identity from a variant key and selects a stable display profile", () => {
+		const encoded = createModelVariant(
+			{
+				provider: "provider with spaces",
+				id: "model/name",
+				api: "openai-responses",
+				baseUrl: "https://example.com/v1",
+				efforts: [Effort.Low],
+			},
+			{ authChannel: "api_key", reasoningConfig: Effort.Low },
+		);
+		expect(parseModelVariantKey(encoded.key)).toEqual({ provider: "provider with spaces", modelId: "model/name" });
+		const coding = createDefaultCapabilityProfile(encoded, {}, "coding");
+		coding.samples = 9;
+		coding.coldStart = false;
+		const global = createDefaultCapabilityProfile(encoded, {}, "global");
+		global.samples = 2;
+		global.coldStart = false;
+		const indexed = indexCapabilityProfilesByModel([coding, global]);
+		expect(indexed.get("provider with spaces/model/name")).toBe(global);
+	});
+
 	it("updates exact capability profiles with weighted observations", () => {
 		const registry = new ModelCapabilityRegistry();
 		registry.registerFamilyPrior("openai", { toolSchemaReliability: 0.8 });
@@ -1652,13 +1676,32 @@ describe("adaptive model routing", () => {
 
 	it("classifies analysis questions as read-only and exposes permission as an orthogonal policy", () => {
 		const profile = createDefaultCapabilityProfile(variant);
-		const analysis = inferTaskFeatures("为什么删除用户失败？请分析原因，不要修改代码");
-		expect(analysis.readOnly).toBe(true);
-		expect(analysis.writesWorkspace).toBe(false);
-		expect(routeTask(analysis, profile).policy.permissions).toBe("read-only");
+		for (const task of [
+			"为什么删除用户失败？请分析原因，不要修改代码",
+			"分析删除失败",
+			"解释如何修复登录错误，不要改任何文件",
+			"Explain how to fix login without changing code",
+		]) {
+			const analysis = inferTaskFeatures(task);
+			expect(analysis.readOnly).toBe(true);
+			expect(analysis.writesWorkspace).toBe(false);
+			expect(routeTask(analysis, profile).policy.permissions).toBe("read-only");
+		}
 		const implementation = inferTaskFeatures("修复登录错误并运行测试");
 		expect(implementation.readOnly).toBe(false);
 		expect(routeTask(implementation, profile).policy.permissions).toBe("write");
+		for (const task of ["分析后修复登录错误", "Review the issue and fix it", "Delete production data"]) {
+			expect(inferTaskFeatures(task).readOnly).toBe(false);
+		}
+	});
+
+	it("defaults ambiguous mutation mentions to read-only unless the host supplies write evidence", () => {
+		const ambiguous = inferTaskFeatures("This function deletes users when authentication fails");
+		expect(ambiguous.readOnly).toBe(true);
+		expect(ambiguous.writesWorkspace).toBe(false);
+		const hintedWrite = inferTaskFeatures("Investigate the authentication failure", { writesWorkspace: true });
+		expect(hintedWrite.readOnly).toBe(false);
+		expect(hintedWrite.writesWorkspace).toBe(true);
 	});
 
 	it("lets explicit route overrides win over inferred policy", () => {
@@ -2129,6 +2172,16 @@ describe("standalone workspace tools", () => {
 		await expect(toolNamed(tools.allTools, "search").execute("search", { pattern: "x".repeat(513) })).rejects.toThrow(
 			"exceeds 512",
 		);
+		for (const pattern of ["(a+)+$", "(a|aa)+$", ".*prefix.*suffix", "(x{1,3})+"]) {
+			await expect(toolNamed(tools.allTools, "search").execute("search", { pattern })).rejects.toThrow(
+				"Unsafe search pattern",
+			);
+		}
+		await expect(
+			toolNamed(tools.allTools, "search").execute("search", { pattern: String.raw`(a)\1` }),
+		).rejects.toThrow("backreferences");
+		const safe = await toolNamed(tools.allTools, "search").execute("search", { pattern: "need(?:le|les)" });
+		expect(safe.isError).not.toBe(true);
 	});
 
 	it("rejects a stale snapshot after an external write", async () => {

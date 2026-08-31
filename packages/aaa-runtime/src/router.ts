@@ -22,8 +22,10 @@ const MULTI_FILE_PATTERN =
 	/\b(multi[- ]file|multiple files|across files|multiple (?:repositories|repos|packages|projects))\b|多文件|多个文件|跨文件|多(?:个)?(?:仓库|项目|包)|跨(?:仓库|项目)|(?:两|二|三|四|五|六|七|八|九|十|\d+)\s*个?(?:文件|仓库|项目|包)/i;
 const MULTI_STEP_PATTERN =
 	/\b(multi[- ]step|multiple steps|end[- ]to[- ]end)\b|多步骤|多个步骤|端到端|全链路|一路追踪|逐个|分别|至少\s*[2-9]/i;
-const WRITE_PATTERN =
-	/\b(implement|fix|add|update|edit|refactor|migrate|delete|remove|write)\b|实现|修复|新增|修改|重构|迁移|删除|编写/i;
+// Mutation permission must come from an affirmative action request, not merely
+// from mentioning a mutation verb (for example, "analyze why delete failed").
+const WRITE_REQUEST_PATTERN =
+	/(?:^|[.!?;\n]\s*|\b(?:please|then|and|can you|could you|need to|must|should)\s+)(?:implement|fix|repair|resolve|add|create|build|update|edit|change|refactor|migrate|delete|remove|write|debug)\b|(?:^|[，。；;！!？?\n]\s*|(?:请|帮我|需要|必须|务必|直接|并|然后|再|接着|随后|分析后)\s*)(?:实现|修复|新增|创建|搭建|修改|改一下|改掉|改成|重构|迁移|删除|移除|编写|调试|排查并处理)/im;
 const DESTRUCTIVE_PATTERN = /\b(drop|delete|remove|destroy|reset|rewrite|migrate)\b|删除|销毁|重置|重写|迁移/i;
 const VERIFY_PATTERN = /\b(test|verify|validate|check|browser|smoke)\b|测试|验证|检查|浏览器/i;
 const DEBUG_PATTERN = /\b(debug|bug|failure|error|crash|regression|broken)\b|调试|故障|错误|崩溃|回归|修复/i;
@@ -32,12 +34,11 @@ const GUI_PATTERN = /\b(gui|browser|desktop|screenshot|visual|ui|ux)\b|界面|�
 const DOCUMENT_PATTERN = /\b(document|pdf|slides?|spreadsheet|translate)\b|文档|论文|报告|幻灯片|表格|翻译/i;
 
 const EXPLICIT_READ_ONLY_PATTERN =
-	/\b(?:read[- ]only|analysis only|inspect(?:ation)? only|for review only)\b|只(?:读|分析|看)|仅(?:分析|阅读|查看|了解)|(?:不要|不得|不能|别)(?:修改|编辑|写入|改动|动代码)/i;
+	/\b(?:read[- ]only|analysis only|inspect(?:ation)? only|for review only)\b|\b(?:do not|don't|must not|never|without)\b.{0,32}\b(?:modify|modifying|change|changing|edit|editing|write|writing|delete|deleting|remove|removing)\b|只(?:读|分析|看)|仅(?:分析|阅读|查看|了解)|(?:不要|不得|不能|别|请勿)\s*(?:再)?\s*(?:修改|编辑|写入|改动|改变|改|动)(?:任何)?(?:代码|文件|内容)?/i;
 const QUESTION_TROUBLE_PATTERN =
 	/(?:为什么|为何|什么原因|怎么回事|how come|why (?:is|are|does|did|do|can't|cannot))[^。.!?\n]{0,48}(?:失败|错误|报错|异常|崩(?:溃|了)|挂了|不(?:工作|生效|行|起作用)|bug|broken|fail(?:s|ed|ure)?)/i;
-const REPAIR_REQUEST_PATTERN = /\b(?:fix|repair|resolve)\b|(?:修复|修一下|修好|解决|排查并处理)/i;
 const NEGATED_WRITE_PATTERN =
-	/\b(?:do not|don't|must not|never)\s+(?:implement|modify|edit|write|change|delete|remove)\b|(?:不得|不要|禁止|不准|无需)(?:修改|编辑|写入|改动|删除)|只读/gi;
+	/\b(?:do not|don't|must not|never|without)\b.{0,32}\b(?:implement(?:ing)?|modify(?:ing)?|edit(?:ing)?|writ(?:e|ing)|chang(?:e|ing)|delet(?:e|ing)|remov(?:e|ing))\b|(?:不得|不要|禁止|不准|无需|请勿)\s*(?:再)?\s*(?:修改|编辑|写入|改动|改变|改|删除|移除|动)(?:任何)?(?:代码|文件|内容)?|只读/gi;
 
 const MIN_ADAPTATION_CONFIDENCE = 0.5;
 const BASE_POLICY: Record<ExecutionLane, ExecutionPolicy> = {
@@ -119,7 +120,7 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 	const multiStep = MULTI_STEP_PATTERN.test(task);
 	const multiFile = MULTI_FILE_PATTERN.test(task);
 	const negationStripped = task.replace(NEGATED_WRITE_PATTERN, "");
-	const writeIntent = WRITE_PATTERN.test(negationStripped);
+	const writeRequest = WRITE_REQUEST_PATTERN.test(negationStripped);
 	const parallelIntent = PARALLEL_PATTERN.test(task.replace(NEGATED_PARALLEL_PATTERN, ""));
 	const estimatedSteps =
 		hints.estimatedSteps ?? Math.max(1, numberedSteps || (multiStep || task.length > 600 ? 3 : 1));
@@ -131,15 +132,15 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 	// also asks for the repair.
 	const readOnly =
 		hints.readOnly ??
-		(EXPLICIT_READ_ONLY_PATTERN.test(task) ||
-			!writeIntent ||
-			(QUESTION_TROUBLE_PATTERN.test(task) && !REPAIR_REQUEST_PATTERN.test(negationStripped)));
+		(hints.writesWorkspace === true
+			? false
+			: EXPLICIT_READ_ONLY_PATTERN.test(task) || !writeRequest || QUESTION_TROUBLE_PATTERN.test(task));
 	return {
 		estimatedSteps,
 		estimatedFiles,
 		independentBranches: hints.independentBranches ?? (parallelIntent ? 2 : 1),
 		contextTokens: hints.contextTokens ?? 0,
-		writesWorkspace: hints.writesWorkspace ?? (writeIntent && !readOnly),
+		writesWorkspace: hints.writesWorkspace ?? (writeRequest && !readOnly),
 		readOnly,
 		destructiveRisk: hints.destructiveRisk ?? (DESTRUCTIVE_PATTERN.test(task) ? 0.75 : 0.1),
 		requiresVerification: hints.requiresVerification ?? VERIFY_PATTERN.test(task),

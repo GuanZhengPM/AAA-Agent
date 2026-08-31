@@ -32,6 +32,7 @@ import {
 	appendRunRecord,
 	createDefaultCapabilityProfile,
 	type ExecutionLane,
+	indexCapabilityProfilesByModel,
 	inferTaskFeatures,
 	inferTaskSlice,
 	loadAdaptiveHarnessState,
@@ -65,7 +66,7 @@ const HELP = `AAA Agent (3A Agent) — interactive, model-aware coding agent
 
 Usage:
   aaa
-  aaa chat [--resume [id] | --new] [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--cwd <path>]
+  aaa chat [--resume [id] | --new] [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--read-only | --allow-write] [--lane <direct|guided|orchestrated>] [--verification <none|targeted|strict>] [--cwd <path>]
   aaa run [--model <id>] [--verifier-model <id>] [--subagent-model <id>] [--effort <mode>] [--tier <tier> | --fast] [--read-only | --allow-write] [--lane <direct|guided|orchestrated>] [--verification <none|targeted|strict>] [--shell-policy <deny|ask|sandbox|allow>] [--cwd <path>] [--verbose] <task>
   aaa sessions [query]
   aaa models
@@ -377,6 +378,10 @@ async function parseSessionArguments(args: string[]): Promise<SessionArguments> 
 	let cwd = process.cwd();
 	let resume: string | true | undefined;
 	let fresh = false;
+	let readOnlyFlag = false;
+	let allowWriteFlag = false;
+	let laneOverride: ExecutionLane | undefined;
+	let verificationOverride: VerificationStrength | undefined;
 	for (let index = 0; index < args.length; index += 1) {
 		const arg = args[index];
 		if (arg === "--model") {
@@ -415,11 +420,24 @@ async function parseSessionArguments(args: string[]): Promise<SessionArguments> 
 			}
 		} else if (arg === "--new") {
 			fresh = true;
+		} else if (arg === "--read-only") {
+			readOnlyFlag = true;
+		} else if (arg === "--allow-write") {
+			allowWriteFlag = true;
+		} else if (arg === "--lane") {
+			const value = args[++index];
+			if (!value) throw new Error("--lane requires a value");
+			laneOverride = parseLane(value);
+		} else if (arg === "--verification") {
+			const value = args[++index];
+			if (!value) throw new Error("--verification requires a value");
+			verificationOverride = parseVerificationStrength(value);
 		} else {
 			throw new Error(`Unknown interactive option '${arg}'.`);
 		}
 	}
 	if (fresh && resume) throw new Error("--new and --resume cannot be used together.");
+	const permissionOverride = parsePermissionOverride(readOnlyFlag, allowWriteFlag);
 	return {
 		...(modelId ? { modelId } : {}),
 		...(verifierModelId ? { verifierModelId } : {}),
@@ -429,6 +447,9 @@ async function parseSessionArguments(args: string[]): Promise<SessionArguments> 
 		...(resume ? { resume } : {}),
 		fresh,
 		cwd,
+		...(permissionOverride ? { permissionOverride } : {}),
+		...(laneOverride ? { laneOverride } : {}),
+		...(verificationOverride ? { verificationOverride } : {}),
 	};
 }
 
@@ -527,14 +548,14 @@ async function persistRun(
 async function printModels(): Promise<void> {
 	const [selected, models] = await Promise.all([resolveSelectedModel(), listModels()]);
 	const state = await loadAdaptiveHarnessState();
-	const profileByVariant = new Map(state.profiles.map(profile => [profile.variantKey, profile]));
+	const profileByModel = indexCapabilityProfilesByModel(state.profiles);
 	for (const model of models) {
 		const modes = supportedThinkingModes(model).join(",");
 		const tiers = model.serviceTiers?.join(",") || "standard";
 		const key = `${model.provider}/${model.id}`;
 		const marker = key === `${selected.provider}/${selected.id}` ? "*" : " ";
 		const plan = model.servicePlan ?? (model.authChannel === "subscription" ? "subscription" : "payg");
-		const profile = profileByVariant.get(key);
+		const profile = profileByModel.get(key);
 		const evidence =
 			profile?.coldStart === false ? `samples=${profile.samples.toFixed(1)}` : "samples=0 (cold start; defaults)";
 		process.stdout.write(
@@ -691,6 +712,9 @@ async function startInteractive(args: string[]): Promise<void> {
 			...(serviceTier ? { serviceTier } : {}),
 			cwd: parsed.cwd,
 			adaptive: state.adaptiveEnabled,
+			...(parsed.permissionOverride ? { permissionMode: parsed.permissionOverride } : {}),
+			...(parsed.laneOverride ? { laneOverride: parsed.laneOverride } : {}),
+			...(parsed.verificationOverride ? { verificationOverride: parsed.verificationOverride } : {}),
 			async setAdaptive(enabled, reset) {
 				state.adaptiveEnabled = enabled;
 				if (reset) {
@@ -729,6 +753,8 @@ async function startInteractive(args: string[]): Promise<void> {
 					...(verifier ? { verifier } : {}),
 					...(subagent ? { subagent } : {}),
 					...(request.permissionMode ? { permissionOverride: request.permissionMode } : {}),
+					...(request.laneOverride ? { laneOverride: request.laneOverride } : {}),
+					...(request.verificationOverride ? { verificationOverride: request.verificationOverride } : {}),
 					capabilities,
 					overlays,
 					additionalTools: [createHistorySearchTool(request.cwd)],

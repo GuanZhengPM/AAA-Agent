@@ -13,8 +13,6 @@
 
 /** 命令中"看起来像路径"的 token 必须含分隔符或扩展名，否则视为命令词。 */
 const PATH_TOKEN_PATTERN = /[\w@./\\-]+/g;
-/** 常见测试目录：显式指向这些目录意味着跑的是项目测试集。 */
-const TEST_DIRECTORY_PATTERN = /(?:^|\/)(?:tests?|spec|specs|__tests__|__mocks__|__snapshots__)(?:\/|$)/i;
 /** 纯命令词，永远不当作路径目标。 */
 const NON_TARGET_TOKENS = new Set([
 	"bun",
@@ -62,6 +60,12 @@ function stemCandidates(value: string): Set<string> {
 	const stems = new Set<string>([base, full]);
 	const firstDot = full.indexOf(".");
 	if (firstDot > 0) stems.add(full.slice(0, firstDot));
+	for (const stem of [...stems]) {
+		const withoutTestPrefix = stem.replace(/^(?:test|spec)[_-]/i, "");
+		const withoutTestSuffix = stem.replace(/[_-](?:test|spec)$/i, "");
+		if (withoutTestPrefix !== stem) stems.add(withoutTestPrefix);
+		if (withoutTestSuffix !== stem) stems.add(withoutTestSuffix);
+	}
 	return stems;
 }
 
@@ -69,9 +73,20 @@ function looksLikePath(token: string): boolean {
 	return token.includes("/") || token.includes(".");
 }
 
+function normalizeCommand(value: string): string {
+	return value.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function taskNamesCommand(task: string | undefined, command: string): boolean {
+	if (!task) return false;
+	const normalizedCommand = normalizeCommand(command);
+	if (!normalizedCommand) return false;
+	return normalizeCommand(task).includes(normalizedCommand);
+}
+
 /**
- * 提取命令里指向的具体文件或目录。空数组代表这是一条"项目级"命令
- * （例如 `bun test`、`npm run lint`），它不针对某个具体路径。
+ * 提取命令里指向的具体文件或目录。空数组仅代表命令没有显式目标；
+ * 不能据此推断它覆盖了当前需求。
  */
 export function extractCommandTargets(command: string): string[] {
 	const targets: string[] = [];
@@ -94,17 +109,18 @@ function directoryOf(value: string): string {
 /**
  * 判断一条检查命令是否覆盖了本次改动。
  *
- * - 用户在任务里点名的检查（任务文本出现了该命令指向的目标）无条件视为相关：
+ * - 用户在任务里点名的完整检查命令，或点名命令指向的目标，视为相关：
  *   那是使用者自己声明的验收方式，不是 Agent 自选的证据；
- * - 项目级命令（未指向任何具体路径）视为覆盖整个工作区；
- * - 指向测试目录视为覆盖项目测试集；
  * - 指向具体文件时，必须与某个被改动文件同名（忽略扩展名与目录）或同目录；
+ * - 裸 `bun test` / `npm run check` 只证明现有测试或静态检查通过，不能证明
+ *   用户要求的行为已经实现，因此默认交给独立 verifier；
  * - 其余情况一律视为未覆盖。
  */
 export function isAcceptanceBound(command: string, changedFiles: readonly string[], task?: string): boolean {
 	if (changedFiles.length === 0) return false;
+	if (taskNamesCommand(task, command)) return true;
 	const targets = extractCommandTargets(command);
-	if (targets.length === 0) return true;
+	if (targets.length === 0) return false;
 	if (task) {
 		const haystack = task.toLowerCase();
 		for (const target of targets) {
@@ -123,7 +139,6 @@ export function isAcceptanceBound(command: string, changedFiles: readonly string
 	}
 
 	for (const target of targets) {
-		if (TEST_DIRECTORY_PATTERN.test(target)) return true;
 		if (changedDirectories.has(target.toLowerCase())) return true;
 		for (const stem of stemCandidates(target)) {
 			const candidate = stem.toLowerCase();
