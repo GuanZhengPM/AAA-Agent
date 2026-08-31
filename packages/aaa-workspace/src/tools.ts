@@ -285,6 +285,7 @@ async function runCapturedProcess(
 		detached,
 		env: environment,
 	});
+	let windowsTermination: Promise<void> | undefined;
 	const killProcessTree = (force: boolean): void => {
 		try {
 			const signalName = force ? "SIGKILL" : "SIGTERM";
@@ -295,6 +296,23 @@ async function runCapturedProcess(
 		}
 	};
 	const onAbort = (): void => {
+		if (process.platform === "win32") {
+			// Killing cmd.exe alone orphans the command it launched and leaves its
+			// pipes and working directory open. taskkill /T terminates that full tree.
+			windowsTermination ??= (async () => {
+				try {
+					const killer = Bun.spawn(["taskkill.exe", "/pid", String(child.pid), "/t", "/f"], {
+						stdin: "ignore",
+						stdout: "ignore",
+						stderr: "ignore",
+					});
+					await killer.exited;
+				} catch {
+					killProcessTree(true);
+				}
+			})();
+			return;
+		}
 		killProcessTree(false);
 		void (async () => {
 			await Bun.sleep(250);
@@ -328,6 +346,7 @@ async function runCapturedProcess(
 		};
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		await windowsTermination;
 		if (privateTemporaryDirectory) {
 			await fs.rm(privateTemporaryDirectory, { recursive: true, force: true });
 		}
