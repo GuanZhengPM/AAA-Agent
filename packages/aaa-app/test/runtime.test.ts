@@ -1685,7 +1685,9 @@ describe("adaptive model routing", () => {
 			const analysis = inferTaskFeatures(task);
 			expect(analysis.readOnly).toBe(true);
 			expect(analysis.writesWorkspace).toBe(false);
-			expect(routeTask(analysis, profile).policy.permissions).toBe("read-only");
+			const route = routeTask(analysis, profile);
+			expect(route.policy.permissions).toBe("read-only");
+			expect(analysis.destructiveRisk).toBe(0.1);
 		}
 		const implementation = inferTaskFeatures("修复登录错误并运行测试");
 		expect(implementation.readOnly).toBe(false);
@@ -1702,6 +1704,23 @@ describe("adaptive model routing", () => {
 		const hintedWrite = inferTaskFeatures("Investigate the authentication failure", { writesWorkspace: true });
 		expect(hintedWrite.readOnly).toBe(false);
 		expect(hintedWrite.writesWorkspace).toBe(true);
+	});
+
+	it("exposes execution tools for explicit checks without treating analysis of test failures as execution", () => {
+		const profile = createDefaultCapabilityProfile(variant);
+		for (const task of ["Run the tests and report the result", "运行测试并报告结果"]) {
+			const features = inferTaskFeatures(task);
+			expect(features.readOnly).toBe(false);
+			expect(features.writesWorkspace).toBe(false);
+			expect(features.requiresVerification).toBe(true);
+			expect(routeTask(features, profile).policy.permissions).toBe("write");
+		}
+		for (const task of ["Analyze why the test failed", "分析测试失败原因", "检查代码并列出风险"]) {
+			const features = inferTaskFeatures(task);
+			expect(features.readOnly).toBe(true);
+			expect(features.requiresVerification).toBe(false);
+			expect(routeTask(features, profile).policy.permissions).toBe("read-only");
+		}
 	});
 
 	it("lets explicit route overrides win over inferred policy", () => {
@@ -1861,7 +1880,7 @@ describe("completion gates", () => {
 			model: variant,
 			featureHints: { estimatedFiles: 2, writesWorkspace: true },
 		});
-		expect(roundArtifacts).toEqual([[], []]);
+		expect(roundArtifacts).toEqual([[], [], []]);
 		expect(result.checkpoint.artifacts).toEqual([]);
 		expect(result.checkpoint.facts).toEqual([]);
 	});

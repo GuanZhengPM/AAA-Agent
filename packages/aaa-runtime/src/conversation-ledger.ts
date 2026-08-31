@@ -26,7 +26,7 @@ export const MAX_LEDGER_ENTRIES = 48;
 const BACKTICK = "`";
 const CODE_TOKEN = "[A-Za-z_][A-Za-z0-9_]*(?:[.-][A-Za-z0-9_]+)*";
 const FILE_PATH = "[\\w@][\\w\\-./@]*\\.(?:md|py|txt|json|csv|tsv|yaml|yml|sh|toml|ini|log)";
-const OPTIONAL_TICKS = "[" + BACKTICK + "\"'“”*]{0,2}";
+const OPTIONAL_TICKS = `[${BACKTICK}"'“”*]{0,2}`;
 
 function clean(value: string): string {
 	return value
@@ -72,7 +72,7 @@ export function extractLedgerEntries(message: string, turn = 0): LedgerEntry[] {
 			"gi",
 		),
 		new RegExp(
-			"\\b(?:create|add|write|generate)\\b[^.;\\n]{0,24}?" + OPTIONAL_TICKS + "(" + FILE_PATH + ")" + OPTIONAL_TICKS,
+			`\\b(?:create|add|write|generate)\\b[^.;\\n]{0,24}?${OPTIONAL_TICKS}(${FILE_PATH})${OPTIONAL_TICKS}`,
 			"gi",
 		),
 	];
@@ -121,9 +121,7 @@ export function extractLedgerEntries(message: string, turn = 0): LedgerEntry[] {
 	for (const match of message.matchAll(shapeB)) {
 		const start = Math.max(0, (match.index ?? 0) - 90);
 		const window = message.slice(start, match.index ?? 0);
-		const beforeTick = new RegExp(
-			BACKTICK + "?(" + CODE_TOKEN + ")" + BACKTICK + "?[^" + BACKTICK + "。；;\\n]{0,30}$",
-		);
+		const beforeTick = new RegExp(`${BACKTICK}?(${CODE_TOKEN})${BACKTICK}?[^${BACKTICK}。；;\\n]{0,30}$`);
 		const subjectMatch = window.match(beforeTick);
 		let subject = "";
 		if (subjectMatch?.[1]) subject = clean(subjectMatch[1]);
@@ -143,7 +141,7 @@ export function extractLedgerEntries(message: string, turn = 0): LedgerEntry[] {
 	const invariantWords =
 		"(?:保持|恒定|锁定|(?:不要|不许|不能|请勿)(?:再)?(?:动|改|变更)|(?:永|远)?不变|(?:永|远)?不动|stays|remains|never change)";
 	const invariantHead = new RegExp(
-		OPTIONAL_TICKS + "(" + CODE_TOKEN + ")" + OPTIONAL_TICKS + "[^。；;\\n]{0,30}?" + invariantWords,
+		`${OPTIONAL_TICKS}(${CODE_TOKEN})${OPTIONAL_TICKS}[^。；;\\n]{0,30}?${invariantWords}`,
 		"g",
 	);
 	for (const head of message.matchAll(invariantHead)) {

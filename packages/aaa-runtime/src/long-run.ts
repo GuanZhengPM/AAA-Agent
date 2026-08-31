@@ -10,7 +10,8 @@ import type {
 } from "./types";
 
 export function maxLongRunRounds(snapshot: AdaptivePolicySnapshot): number {
-	if (snapshot.route.policy.lane !== "direct") return 2;
+	if (snapshot.route.policy.lane === "orchestrated") return 4;
+	if (snapshot.route.policy.lane === "guided") return 3;
 	// Verified tasks need one extra round so an honest host-gate downgrade can
 	// be repaired within the same user turn instead of failing terminally.
 	const verification = snapshot.route.policy.verification;

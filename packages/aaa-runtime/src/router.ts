@@ -26,8 +26,9 @@ const MULTI_STEP_PATTERN =
 // from mentioning a mutation verb (for example, "analyze why delete failed").
 const WRITE_REQUEST_PATTERN =
 	/(?:^|[.!?;\n]\s*|\b(?:please|then|and|can you|could you|need to|must|should)\s+)(?:implement|fix|repair|resolve|add|create|build|update|edit|change|refactor|migrate|delete|remove|write|debug)\b|(?:^|[，。；;！!？?\n]\s*|(?:请|帮我|需要|必须|务必|直接|并|然后|再|接着|随后|分析后)\s*)(?:实现|修复|新增|创建|搭建|修改|改一下|改掉|改成|重构|迁移|删除|移除|编写|调试|排查并处理)/im;
+const EXECUTABLE_VERIFICATION_PATTERN =
+	/(?:^|[.!?;\n]\s*|\b(?:please|then|and|can you|could you|need to|must|should)\s+)(?:(?:run|execute)\s+(?:the\s+)?(?:tests?|checks?|lint|typecheck|build|smoke(?:\s+tests?)?)|test|verify|validate)\b|(?:^|[，。；;！!？?\n]\s*|(?:请|帮我|需要|必须|务必|直接|并|然后|再|接着|随后)\s*)(?:(?:运行|执行|跑)[^。；;\n]{0,12}(?:测试|检查|校验|构建)|(?:测试|验证|验收)(?:一下)?)/im;
 const DESTRUCTIVE_PATTERN = /\b(drop|delete|remove|destroy|reset|rewrite|migrate)\b|删除|销毁|重置|重写|迁移/i;
-const VERIFY_PATTERN = /\b(test|verify|validate|check|browser|smoke)\b|测试|验证|检查|浏览器/i;
 const DEBUG_PATTERN = /\b(debug|bug|failure|error|crash|regression|broken)\b|调试|故障|错误|崩溃|回归|修复/i;
 const RESEARCH_PATTERN = /\b(research|compare|survey|investigate|evidence|sources?)\b|研究|调研|比较|证据|来源/i;
 const GUI_PATTERN = /\b(gui|browser|desktop|screenshot|visual|ui|ux)\b|界面|浏览器|桌面|截图|视觉/i;
@@ -121,6 +122,8 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 	const multiFile = MULTI_FILE_PATTERN.test(task);
 	const negationStripped = task.replace(NEGATED_WRITE_PATTERN, "");
 	const writeRequest = WRITE_REQUEST_PATTERN.test(negationStripped);
+	const verificationRequest = EXECUTABLE_VERIFICATION_PATTERN.test(negationStripped);
+	const executableRequest = writeRequest || verificationRequest;
 	const parallelIntent = PARALLEL_PATTERN.test(task.replace(NEGATED_PARALLEL_PATTERN, ""));
 	const estimatedSteps =
 		hints.estimatedSteps ?? Math.max(1, numberedSteps || (multiStep || task.length > 600 ? 3 : 1));
@@ -134,7 +137,9 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 		hints.readOnly ??
 		(hints.writesWorkspace === true
 			? false
-			: EXPLICIT_READ_ONLY_PATTERN.test(task) || !writeRequest || QUESTION_TROUBLE_PATTERN.test(task));
+			: EXPLICIT_READ_ONLY_PATTERN.test(task) ||
+				!executableRequest ||
+				(QUESTION_TROUBLE_PATTERN.test(task) && !writeRequest && !verificationRequest));
 	return {
 		estimatedSteps,
 		estimatedFiles,
@@ -142,8 +147,9 @@ export function inferTaskFeatures(task: string, hints: TaskFeatureHints = {}): T
 		contextTokens: hints.contextTokens ?? 0,
 		writesWorkspace: hints.writesWorkspace ?? (writeRequest && !readOnly),
 		readOnly,
-		destructiveRisk: hints.destructiveRisk ?? (DESTRUCTIVE_PATTERN.test(task) ? 0.75 : 0.1),
-		requiresVerification: hints.requiresVerification ?? VERIFY_PATTERN.test(task),
+		destructiveRisk:
+			hints.destructiveRisk ?? (writeRequest && !readOnly && DESTRUCTIVE_PATTERN.test(task) ? 0.75 : 0.1),
+		requiresVerification: hints.requiresVerification ?? verificationRequest,
 		requiresGoalDag: hints.requiresGoalDag ?? false,
 		userRequestedPlan: hints.userRequestedPlan ?? PLAN_PATTERN.test(task),
 		userRequestedParallel: hints.userRequestedParallel ?? parallelIntent,
