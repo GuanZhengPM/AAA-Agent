@@ -37,8 +37,12 @@ jobs:
         run: bun test packages/aaa-app/test/memory-history.test.ts -t "session transcript"
       - name: Test context budgeting
         run: bun test packages/aaa-app/test/memory-history.test.ts -t "rolling digest|context injection"
-      - name: Test provider retries
-        run: bun test packages/aaa-app/test/memory-history.test.ts -t "transient provider retry"
+      - name: Test provider retry classification
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "retries transient failures"
+      - name: Test provider attempt timeout
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "turns a stalled HTTP attempt"
+      - name: Test provider retry cancellation
+        run: bun test packages/aaa-app/test/memory-history.test.ts -t "aborts promptly"
       - name: Test adaptive runtime
         run: bun test packages/aaa-app/test/runtime.test.ts
       - name: Test session storage
