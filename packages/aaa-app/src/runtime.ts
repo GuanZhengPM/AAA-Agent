@@ -42,6 +42,7 @@ import {
 } from "@aaa-agent/runtime";
 import {
 	createAdaptiveToolset,
+	createShellInvocation,
 	createVerificationCheckTool,
 	defineVerificationCheck,
 	type ShellApprovalRequest,
@@ -465,7 +466,7 @@ async function execCapture(command: string, cwd: string, timeoutMs = 180_000): P
 	// pipes concurrently (avoids child-process backpressure deadlocks) and retain
 	// bounded failure output so recovery does not need to execute it again.
 	try {
-		const child = Bun.spawn(["/bin/bash", "-c", command], {
+		const child = Bun.spawn(createShellInvocation(command), {
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

@@ -33,6 +33,10 @@ function isIgnoredSearchPath(file: string): boolean {
 	return file.split(/[\\/]/).some(segment => IGNORED_SEARCH_SEGMENTS[segment] === true);
 }
 
+function normalizeToolPath(file: string): string {
+	return file.replaceAll("\\", "/");
+}
+
 interface RegexGroupState {
 	hasAlternation: boolean;
 	hasQuantifier: boolean;
@@ -711,7 +715,7 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 			const matches: string[] = [];
 			for await (const match of new Bun.Glob(params.pattern).scan({ cwd: root, dot: true, onlyFiles: true })) {
 				if (isIgnoredSearchPath(match)) continue;
-				matches.push(match);
+				matches.push(normalizeToolPath(match));
 				if (matches.length >= (params.limit ?? 200)) break;
 			}
 			matches.sort();
@@ -760,7 +764,7 @@ export function createAdaptiveToolset(cwd: string, options: AdaptiveToolsetOptio
 				for (let index = 0; index < lines.length; index += 1) {
 					const line = lines[index] ?? "";
 					if (!expression.test(line)) continue;
-					matches.push(`${file}:${index + 1}:${line.slice(0, MAX_LINE_LENGTH)}`);
+					matches.push(`${normalizeToolPath(file)}:${index + 1}:${line.slice(0, MAX_LINE_LENGTH)}`);
 					if (matches.length >= limit) break;
 				}
 				if (matches.length >= limit) break;

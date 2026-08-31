@@ -1046,6 +1046,10 @@ describe("independent Codex identity", () => {
 		);
 		let primaryTurn = 0;
 		let verifierCalls = 0;
+		const acceptanceCommand =
+			process.platform === "win32"
+				? "python -m unittest tests/test_smoke.py -v && python -c \"print('COMPOUND_OK')\""
+				: "python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY";
 		const provider: AgentTurnProvider = {
 			provider: "test",
 			async runTurn(options) {
@@ -1062,8 +1066,7 @@ describe("independent Codex identity", () => {
 									callId: "check-1",
 									name: "shell",
 									arguments: JSON.stringify({
-										command:
-											"python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY",
+										command: acceptanceCommand,
 									}),
 								}
 							: undefined;
@@ -1118,9 +1121,7 @@ describe("independent Codex identity", () => {
 		expect(result.success).toBe(true);
 		expect(verifierCalls).toBe(0);
 		expect(result.audit?.assurance).toBe("deterministic");
-		expect(result.audit?.evidence[0]?.summary).toContain(
-			"python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'",
-		);
+		expect(result.audit?.evidence[0]?.summary).toContain(acceptanceCommand.split("\n")[0]);
 		expect(result.audit?.evidence[0]?.summary).toContain("exitCode=0");
 	});
 
