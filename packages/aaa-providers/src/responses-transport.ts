@@ -11,6 +11,7 @@ import {
 	type Model,
 	ProviderHttpError,
 	providerErrorCode,
+	releaseProviderAttemptSignal,
 	retryAfterMilliseconds,
 	type UsageMetrics,
 } from "@aaa-agent/runtime";
@@ -181,48 +182,58 @@ interface ResponsesAttempt {
 
 async function sendRequest(options: ResponsesTransportOptions, headers: Headers): Promise<ResponsesAttempt> {
 	const signal = createProviderAttemptSignal(options.turn.signal);
-	const response = await fetch(options.url, {
-		method: "POST",
-		headers,
-		body: JSON.stringify(createResponsesRequestBody(options.turn)),
-		signal,
-	});
-	return { response, signal };
+	try {
+		const response = await fetch(options.url, {
+			method: "POST",
+			headers,
+			body: JSON.stringify(createResponsesRequestBody(options.turn)),
+			signal,
+		});
+		return { response, signal };
+	} catch (error) {
+		releaseProviderAttemptSignal(signal);
+		throw error;
+	}
 }
 
 export async function runResponsesTransport(options: ResponsesTransportOptions): Promise<AgentTurnResult> {
 	let headers = options.headers;
 	let attempt = await sendRequest(options, headers);
-	if (attempt.response.status === 401 && options.refresh) {
-		await attempt.response.body?.cancel();
-		headers = await options.refresh();
-		attempt = await sendRequest(options, headers);
-	}
-	const { response, signal } = attempt;
-	if (!response.ok) throw await responseError(options.label, response);
-	if (!response.body) throw new Error(`${options.label} response had no event stream`);
+	try {
+		if (attempt.response.status === 401 && options.refresh) {
+			await attempt.response.body?.cancel();
+			releaseProviderAttemptSignal(attempt.signal);
+			headers = await options.refresh();
+			attempt = await sendRequest(options, headers);
+		}
+		const { response, signal } = attempt;
+		if (!response.ok) throw await responseError(options.label, response);
+		if (!response.body) throw new Error(`${options.label} response had no event stream`);
 
-	const completedItems: Record<string, unknown>[] = [];
-	let completedResponse: Record<string, unknown> | undefined;
-	for await (const event of readSseJson(response.body, signal)) {
-		const type = typeof event.data.type === "string" ? event.data.type : event.event;
-		if (type === "response.output_text.delta" && typeof event.data.delta === "string") {
-			options.turn.onTextDelta?.(event.data.delta);
+		const completedItems: Record<string, unknown>[] = [];
+		let completedResponse: Record<string, unknown> | undefined;
+		for await (const event of readSseJson(response.body, signal)) {
+			const type = typeof event.data.type === "string" ? event.data.type : event.event;
+			if (type === "response.output_text.delta" && typeof event.data.delta === "string") {
+				options.turn.onTextDelta?.(event.data.delta);
+			}
+			if (type === "response.output_item.done" && isRecord(event.data.item)) completedItems.push(event.data.item);
+			if (type === "response.completed" && isRecord(event.data.response)) completedResponse = event.data.response;
+			if (type === "response.failed" || type === "error") {
+				const error = isRecord(event.data.error) ? event.data.error : event.data;
+				throw new Error(`${options.label} stream failed: ${JSON.stringify(error).slice(0, MAX_ERROR_BODY)}`);
+			}
 		}
-		if (type === "response.output_item.done" && isRecord(event.data.item)) completedItems.push(event.data.item);
-		if (type === "response.completed" && isRecord(event.data.response)) completedResponse = event.data.response;
-		if (type === "response.failed" || type === "error") {
-			const error = isRecord(event.data.error) ? event.data.error : event.data;
-			throw new Error(`${options.label} stream failed: ${JSON.stringify(error).slice(0, MAX_ERROR_BODY)}`);
-		}
+		if (!completedResponse) throw new Error(`${options.label} stream ended before response.completed`);
+		const responseItems = Array.isArray(completedResponse.output) ? completedResponse.output.filter(isRecord) : [];
+		const output = responseItems.length > 0 ? responseItems : completedItems;
+		return {
+			output,
+			text: outputText(output),
+			toolCalls: extractToolCalls(output),
+			usage: usageFromResponse(options.turn.model, completedResponse),
+		};
+	} finally {
+		releaseProviderAttemptSignal(attempt.signal);
 	}
-	if (!completedResponse) throw new Error(`${options.label} stream ended before response.completed`);
-	const responseItems = Array.isArray(completedResponse.output) ? completedResponse.output.filter(isRecord) : [];
-	const output = responseItems.length > 0 ? responseItems : completedItems;
-	return {
-		output,
-		text: outputText(output),
-		toolCalls: extractToolCalls(output),
-		usage: usageFromResponse(options.turn.model, completedResponse),
-	};
 }

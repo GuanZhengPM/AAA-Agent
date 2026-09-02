@@ -139,6 +139,50 @@ describe("interactive permission mode", () => {
 		}
 		expect(parseInteractiveInput("/mode")).toEqual({ type: "mode" });
 	});
+
+	it("persists /mode and forwards it to subsequent tasks", async () => {
+		const home = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-interactive-mode-"));
+		tempDirectories.push(home);
+		const previousHome = process.env.AAA_AGENT_HOME;
+		process.env.AAA_AGENT_HOME = home;
+		try {
+			const input = rawInputStream();
+			const output = outputStream();
+			const saves: InteractiveSession[] = [];
+			const observedModes: Array<string | undefined> = [];
+			const running = runInteractiveTerminal({
+				model,
+				models: [model],
+				thinkingMode: Effort.Low,
+				cwd: home,
+				adaptive: false,
+				input,
+				output: output.stream,
+				runTask: async request => {
+					observedModes.push(request.permissionMode);
+					return completedResult("mode applied");
+				},
+				savePreferences: async () => {},
+				setAdaptive: async () => {},
+				saveSession: async session => {
+					saves.push(structuredClone(session));
+				},
+			});
+			await waitForOutput(output, text => text.includes("you ›"));
+			input.write("/mode read-only\n");
+			await waitForOutput(output, text => text.includes("Task permission mode: read-only."));
+			input.write("inspect the project\n");
+			await waitForOutput(output, text => text.includes("mode applied"));
+			await waitForOutput(output, text => (text.match(/you ›/g) ?? []).length >= 3);
+			input.write("/exit\n");
+			await running;
+			expect(observedModes).toEqual(["read-only"]);
+			expect(saves.at(-1)?.permissionMode).toBe("read-only");
+		} finally {
+			if (previousHome === undefined) delete process.env.AAA_AGENT_HOME;
+			else process.env.AAA_AGENT_HOME = previousHome;
+		}
+	});
 });
 
 describe("interactive model selection", () => {

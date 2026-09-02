@@ -15,6 +15,35 @@ async function syncDirectory(directory: string): Promise<void> {
 	}
 }
 
+function isTransientWindowsRenameError(error: unknown): boolean {
+	if (!(error instanceof Error) || !("code" in error)) return false;
+	return error.code === "EACCES" || error.code === "EBUSY" || error.code === "EPERM";
+}
+
+async function renameAtomically(source: string, destination: string): Promise<void> {
+	if (process.platform !== "win32") {
+		await fs.rename(source, destination);
+		return;
+	}
+
+	// Windows can temporarily deny replacement while another process, antivirus,
+	// or a concurrent reader still holds the destination. Keep the old file in
+	// place and retry the atomic rename instead of unlinking it and exposing a
+	// missing or partially written session file.
+	const deadline = Date.now() + 5_000;
+	let attempt = 0;
+	while (true) {
+		try {
+			await fs.rename(source, destination);
+			return;
+		} catch (error) {
+			if (!isTransientWindowsRenameError(error) || Date.now() >= deadline) throw error;
+			attempt += 1;
+			await new Promise<void>(resolve => setTimeout(resolve, Math.min(10 * attempt, 100)));
+		}
+	}
+}
+
 export async function atomicWriteJson(filePath: string, value: unknown): Promise<void> {
 	const directory = path.dirname(filePath);
 	await fs.mkdir(directory, { recursive: true });
@@ -26,7 +55,7 @@ export async function atomicWriteJson(filePath: string, value: unknown): Promise
 		await handle.sync();
 		await handle.close();
 		handle = undefined;
-		await fs.rename(tempPath, filePath);
+		await renameAtomically(tempPath, filePath);
 		await syncDirectory(directory);
 	} finally {
 		await handle?.close();

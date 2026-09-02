@@ -79,6 +79,7 @@ describe("workspace verification command recognition", () => {
 
 describe("workspace shell temporary files", () => {
 	it("supports heredocs inside the macOS sandbox without leaking temporary files", async () => {
+		if (process.platform !== "darwin") return;
 		const { tool } = await createWorkspaceTool("shell");
 		const result = await tool.execute("heredoc", {
 			command: "python3 - <<'PY'\nprint('HEREDOC_OK')\nPY",

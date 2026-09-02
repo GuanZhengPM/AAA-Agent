@@ -15,12 +15,14 @@ import type {
 	AdaptiveHarnessEvent,
 	AdaptiveHarnessResult,
 	AgentConversationMessage,
+	ExecutionLane,
 	LedgerEntry,
 	LongRunCheckpoint,
 	Model,
 	ServiceTier,
 	StructuredContextState,
 	ThinkingMode,
+	VerificationStrength,
 } from "@aaa-agent/runtime";
 import {
 	extractLedgerEntries,
@@ -113,6 +115,8 @@ export interface InteractiveTaskRequest {
 	onCheckpoint(checkpoint: LongRunCheckpoint): void | Promise<void>;
 	adaptive: boolean;
 	permissionMode?: "read-only" | "write";
+	laneOverride?: ExecutionLane;
+	verificationOverride?: VerificationStrength;
 	signal: AbortSignal;
 	onEvent(event: AdaptiveHarnessEvent): void;
 	onAgentEvent(event: AdaptiveRuntimeAgentEvent): void;
@@ -125,6 +129,9 @@ export interface InteractiveTerminalOptions {
 	serviceTier?: ServiceTier;
 	cwd: string;
 	adaptive: boolean;
+	permissionMode?: "read-only" | "write";
+	laneOverride?: ExecutionLane;
+	verificationOverride?: VerificationStrength;
 	authentication?: (model: Model) => string | undefined;
 	runTask(request: InteractiveTaskRequest): Promise<AdaptiveHarnessResult>;
 	savePreferences(model: Model, thinkingMode: ThinkingMode, serviceTier: ServiceTier | undefined): Promise<void>;
@@ -499,7 +506,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 	compactLiveHistory();
 	let showTools = true;
 	let verbose = false;
-	let permissionMode: "read-only" | "write" | undefined;
+	let permissionMode: "read-only" | "write" | undefined = options.permissionMode ?? session.permissionMode;
 	const sessionApprovedShellCommands = new Set<string>();
 	let adaptive = options.adaptive;
 	let pendingResume =
@@ -535,6 +542,8 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		session.thinkingMode = thinkingMode;
 		if (serviceTier) session.serviceTier = serviceTier;
 		else delete session.serviceTier;
+		if (permissionMode) session.permissionMode = permissionMode;
+		else delete session.permissionMode;
 		// Persist the full transcript; the live (compacted) window is rebuild-time
 		// derived from digest + recent messages instead of replacing history.
 		session.messages = [...transcript];
@@ -560,6 +569,7 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 			model = nextModel;
 			thinkingMode = resolveDefaultThinkingMode(nextModel, selected.thinkingMode);
 			serviceTier = resolveServiceTier(nextModel, selected.serviceTier);
+			permissionMode = options.permissionMode ?? selected.permissionMode;
 			cwd = path.resolve(selected.cwd);
 			transcript = [...selected.messages];
 			const covered = Math.min(selected.digest?.coveredMessages ?? 0, transcript.length);
@@ -605,6 +615,8 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 		}
 		write(`session    ${session.id} · ${session.status}`);
 		write(`permission ${permissionMode ?? "auto"}`);
+		if (options.laneOverride) write(`lane       ${options.laneOverride} (explicit)`);
+		if (options.verificationOverride) write(`verification ${options.verificationOverride} (explicit)`);
 		if (session.pendingTask) write(`pending    ${session.pendingTask.replace(/\s+/g, " ").slice(0, 100)}`);
 		const authentication = options.authentication?.(model);
 		if (authentication) write(`auth       ${authentication}`);
@@ -660,6 +672,9 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 					continue;
 				}
 				permissionMode = value === "auto" ? undefined : value;
+				if (permissionMode) session.permissionMode = permissionMode;
+				else delete session.permissionMode;
+				await persist("active");
 				write(`Task permission mode: ${permissionMode ?? "auto"}.`);
 				continue;
 			}
@@ -943,6 +958,8 @@ export async function runInteractiveTerminal(options: InteractiveTerminalOptions
 					...(serviceTier ? { serviceTier } : {}),
 					cwd,
 					...(permissionMode ? { permissionMode } : {}),
+					...(options.laneOverride ? { laneOverride: options.laneOverride } : {}),
+					...(options.verificationOverride ? { verificationOverride: options.verificationOverride } : {}),
 					conversation: session.digest?.text
 						? [
 								{

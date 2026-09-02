@@ -1,4 +1,71 @@
-import type { AdaptiveGoalNode, EvidenceRef, GoalCompletionReport, GoalLevel, GoalNodeStatus } from "./types";
+import { extractLedgerEntries } from "./conversation-ledger";
+import type {
+	AdaptiveGoalNode,
+	EvidenceRef,
+	GoalCompletionReport,
+	GoalLevel,
+	GoalNodeStatus,
+	GoalSuccessCriterion,
+} from "./types";
+
+export const DEFAULT_RESULT_CRITERION_ID = "result";
+export const DEFAULT_VERIFICATION_CRITERION_ID = "verification";
+const DELIVERABLE_CRITERION_PREFIX = "deliverable:";
+
+function normalizeDeliverablePath(value: string): string {
+	return value.trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/+$/, "");
+}
+
+export function deliverableCriterionId(path: string): string {
+	return `${DELIVERABLE_CRITERION_PREFIX}${encodeURIComponent(normalizeDeliverablePath(path))}`;
+}
+
+export function deliverablePathFromCriterionId(id: string): string | undefined {
+	if (!id.startsWith(DELIVERABLE_CRITERION_PREFIX)) return undefined;
+	try {
+		return normalizeDeliverablePath(decodeURIComponent(id.slice(DELIVERABLE_CRITERION_PREFIX.length)));
+	} catch {
+		return undefined;
+	}
+}
+
+function requestsExecutableVerification(objective: string): boolean {
+	return [
+		/\b(?:run|execute)\s+(?:the\s+)?(?:tests?|checks?|lint|typecheck|build|smoke(?:\s+tests?)?)\b/i,
+		/\b(?:tests?|checks?|lint|typecheck|build)\s+(?:must|should|need(?:s)?\s+to)\s+pass\b/i,
+		/(?:运行|执行)[^。；;\n]{0,12}(?:测试|检查|校验|构建)/,
+		/确保[^。；;\n]{0,16}(?:测试|检查|校验|构建)[^。；;\n]{0,8}通过/,
+	].some(pattern => pattern.test(objective));
+}
+
+/** Derives only obligations that can be checked deterministically by the host. */
+export function deriveDefaultGoalCriteria(objective: string): GoalSuccessCriterion[] {
+	const criteria: GoalSuccessCriterion[] = [
+		{
+			id: DEFAULT_RESULT_CRITERION_ID,
+			description: "Requested outcome is delivered",
+			required: true,
+			evidence: [],
+		},
+	];
+	for (const entry of extractLedgerEntries(objective).filter(entry => entry.kind === "deliverable")) {
+		criteria.push({
+			id: deliverableCriterionId(entry.subject),
+			description: `Requested deliverable exists: ${entry.subject}`,
+			required: true,
+			evidence: [],
+		});
+	}
+	if (requestsExecutableVerification(objective)) {
+		criteria.push({
+			id: DEFAULT_VERIFICATION_CRITERION_ID,
+			description: "Explicitly requested verification passes",
+			required: true,
+			evidence: [],
+		});
+	}
+	return criteria;
+}
 
 /** Stateful objective/checklist/DAG store. Full state stays outside model context. */
 export class AdaptiveGoalStore {
@@ -14,7 +81,7 @@ export class AdaptiveGoalStore {
 				status: "active",
 				dependencies: [],
 				owner: "primary",
-				criteria: [{ id: "result", description: "Requested outcome is delivered", required: true, evidence: [] }],
+				criteria: deriveDefaultGoalCriteria(objective),
 			});
 			return;
 		}

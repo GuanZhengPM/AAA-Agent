@@ -1,1 +1,1 @@
-Search matching lines in workspace files with a JavaScript regular expression and optional file glob. Returns `path:line:text` evidence.
+Search matching lines in workspace files with a conservative JavaScript regular expression and optional file glob. Nested/ambiguous repetition, backreferences, and multiple unbounded wildcards are rejected; split complex expressions into multiple searches. Returns `path:line:text` evidence.

@@ -1,6 +1,11 @@
 import { deriveCapabilityObservation } from "./capability-observation";
 import { createDefaultCapabilityProfile, ModelCapabilityRegistry } from "./capability-registry";
-import { AdaptiveGoalStore } from "./goals";
+import {
+	AdaptiveGoalStore,
+	DEFAULT_RESULT_CRITERION_ID,
+	DEFAULT_VERIFICATION_CRITERION_ID,
+	deliverablePathFromCriterionId,
+} from "./goals";
 import {
 	collectCheckpointArtifacts,
 	createAuditReport,
@@ -58,7 +63,6 @@ function createRunDeadline(milliseconds: number): RunDeadline {
 	const timeoutReason = new Error("Harness deadline exceeded");
 	timeoutReason.name = "TimeoutError";
 	const timer = setTimeout(() => controller.abort(timeoutReason), milliseconds);
-	timer.unref();
 	return {
 		signal: controller.signal,
 		cancel() {
@@ -78,11 +82,39 @@ function attachDefaultGoalEvidence(
 	goalIds: ReadonlySet<string>,
 	evidence: readonly EvidenceRef[],
 ): void {
+	const normalizePath = (value: string): string => value.trim().replaceAll("\\", "/").replace(/^\.\//, "");
+	const evidenceTarget = (item: EvidenceRef): string | undefined => {
+		const target = item.summary?.match(/(?:^|;\s*)target=([^;]+)/)?.[1];
+		return target ? normalizePath(target) : undefined;
+	};
+	const matchesDeliverable = (item: EvidenceRef, path: string): boolean => {
+		if (item.kind !== "file") return false;
+		const expected = normalizePath(path);
+		const target = evidenceTarget(item);
+		if (target && (target === expected || target.endsWith(`/${expected}`))) return true;
+		const ref = normalizePath(item.ref);
+		return ref === expected || ref.endsWith(`/${expected}`);
+	};
+	const isSuccessfulVerification = (item: EvidenceRef): boolean => {
+		if (item.kind !== "test" && item.kind !== "browser") return false;
+		const summary = item.summary?.toLowerCase() ?? "";
+		if (/\b(?:fail(?:ed|ure)?|error)\b|exitcode=[1-9]\d*/.test(summary)) return false;
+		return item.kind === "browser" || /\b(?:pass(?:ed)?|success(?:ful(?:ly)?)?)\b|exitcode=0/.test(summary);
+	};
 	for (const goal of goals.snapshot()) {
 		if (!goalIds.has(goal.id)) continue;
 		for (const criterion of goal.criteria) {
 			if (criterion.evidence.length > 0) continue;
-			for (const item of evidence) goals.attachEvidence(goal.id, criterion.id, item);
+			const deliverable = deliverablePathFromCriterionId(criterion.id);
+			const accepted =
+				criterion.id === DEFAULT_RESULT_CRITERION_ID
+					? evidence
+					: deliverable
+						? evidence.filter(item => matchesDeliverable(item, deliverable))
+						: criterion.id === DEFAULT_VERIFICATION_CRITERION_ID
+							? evidence.filter(isSuccessfulVerification)
+							: [];
+			for (const item of accepted) goals.attachEvidence(goal.id, criterion.id, item);
 		}
 	}
 }

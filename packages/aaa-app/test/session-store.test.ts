@@ -62,6 +62,7 @@ describe("interactive session persistence", () => {
 		await withSessionHome(async directory => {
 			const workspace = path.join(directory, "workspace");
 			const session = createInteractiveSession(workspace, model, "off", "priority");
+			session.permissionMode = "read-only";
 			session.messages = [
 				{ role: "user", text: "repair the lifecycle" },
 				{ role: "assistant", text: "completed" },
@@ -88,6 +89,7 @@ describe("interactive session persistence", () => {
 			expect(loaded).toMatchObject({
 				id: session.id,
 				cwd: path.resolve(workspace),
+				permissionMode: "read-only",
 				modelId: "test/session-model",
 				status: "closed",
 				thinkingMode: "off",

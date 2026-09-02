@@ -9,6 +9,7 @@ const NON_RETRIABLE_QUOTA_PATTERN = /\b1310\b|weekly\/?monthly|usage (?:cap|quot
 
 const RETRY_BACKOFF_MS = [1_500, 4_000, 10_000];
 const DEFAULT_PROVIDER_ATTEMPT_TIMEOUT_MS = 180_000;
+const providerAttemptCleanups = new WeakMap<AbortSignal, () => void>();
 
 export function resolveProviderAttemptTimeoutMs(): number {
 	const configured = Number(process.env.AAA_PROVIDER_ATTEMPT_TIMEOUT_MS);
@@ -23,7 +24,28 @@ export function createProviderAttemptSignal(
 	timeoutMs = resolveProviderAttemptTimeoutMs(),
 ): AbortSignal {
 	if (parent.aborted) return parent;
-	return AbortSignal.any([parent, AbortSignal.timeout(timeoutMs)]);
+	const controller = new AbortController();
+	const timer = setTimeout(
+		() => {
+			controller.abort(new DOMException("Provider request timed out", "TimeoutError"));
+		},
+		Math.max(1, timeoutMs),
+	);
+	const onParentAbort = (): void => controller.abort(parent.reason);
+	parent.addEventListener("abort", onParentAbort, { once: true });
+	const cleanup = (): void => {
+		clearTimeout(timer);
+		parent.removeEventListener("abort", onParentAbort);
+		providerAttemptCleanups.delete(controller.signal);
+	};
+	providerAttemptCleanups.set(controller.signal, cleanup);
+	controller.signal.addEventListener("abort", cleanup, { once: true });
+	return controller.signal;
+}
+
+/** Releases the ref'ed deadline timer after the full response body/stream is consumed. */
+export function releaseProviderAttemptSignal(signal: AbortSignal): void {
+	providerAttemptCleanups.get(signal)?.();
 }
 
 /** Structured HTTP failure so retry policy does not have to scrape strings. */

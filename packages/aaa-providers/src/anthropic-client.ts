@@ -11,6 +11,7 @@ import {
 	type Model,
 	ProviderHttpError,
 	providerErrorCode,
+	releaseProviderAttemptSignal,
 	resolveModelBaseUrl,
 	retryAfterMilliseconds,
 	type UsageMetrics,
@@ -199,57 +200,72 @@ async function runAnthropicTurn(
 	const url = `${resolveModelBaseUrl(options.model)}/v1/messages`;
 	const request = requestBody(options);
 	let fastMode = options.serviceTier === "priority";
-	const send = (): Promise<Response> =>
-		fetch(url, {
-			method: "POST",
-			headers: anthropicHeaders(options.model, credential, fastMode, options.sessionId),
-			body: JSON.stringify(request),
-			signal: createProviderAttemptSignal(options.signal),
-		});
-	let response = await send();
-	if (fastMode && (response.status === 400 || response.status === 429)) {
-		const errorBody = await response.clone().text();
-		if (isFastModeUnsupported(response, errorBody)) {
-			await response.body?.cancel();
-			fastMode = false;
-			delete request.speed;
-			response = await send();
+	const send = async (): Promise<{ response: Response; signal: AbortSignal }> => {
+		const signal = createProviderAttemptSignal(options.signal);
+		try {
+			const response = await fetch(url, {
+				method: "POST",
+				headers: anthropicHeaders(options.model, credential, fastMode, options.sessionId),
+				body: JSON.stringify(request),
+				signal,
+			});
+			return { response, signal };
+		} catch (error) {
+			releaseProviderAttemptSignal(signal);
+			throw error;
 		}
-	}
-	if (!response.ok) {
-		const retryAfterMs = retryAfterMilliseconds(response);
-		const text = (await response.text()).slice(0, MAX_ERROR_BODY);
-		const providerCode = providerErrorCode(text);
-		const message = `Anthropic Messages request failed (${response.status} ${response.statusText}): ${text}`;
-		throw new ProviderHttpError(message, {
-			status: response.status,
-			...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-			...(providerCode ? { providerCode } : {}),
-			hardQuota: isHardQuotaFailure(message, providerCode),
+	};
+	let attempt = await send();
+	try {
+		let response = attempt.response;
+		if (fastMode && (response.status === 400 || response.status === 429)) {
+			const errorBody = await response.clone().text();
+			if (isFastModeUnsupported(response, errorBody)) {
+				await response.body?.cancel();
+				fastMode = false;
+				delete request.speed;
+				releaseProviderAttemptSignal(attempt.signal);
+				attempt = await send();
+				response = attempt.response;
+			}
+		}
+		if (!response.ok) {
+			const retryAfterMs = retryAfterMilliseconds(response);
+			const text = (await response.text()).slice(0, MAX_ERROR_BODY);
+			const providerCode = providerErrorCode(text);
+			const message = `Anthropic Messages request failed (${response.status} ${response.statusText}): ${text}`;
+			throw new ProviderHttpError(message, {
+				status: response.status,
+				...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+				...(providerCode ? { providerCode } : {}),
+				hardQuota: isHardQuotaFailure(message, providerCode),
+			});
+		}
+		const payload: unknown = await response.json();
+		if (!isRecord(payload) || !Array.isArray(payload.content)) {
+			throw new Error("Anthropic Messages response did not contain content blocks");
+		}
+		const content = payload.content.filter(isRecord);
+		const text = content
+			.flatMap(block => (block.type === "text" && typeof block.text === "string" ? [block.text] : []))
+			.join("");
+		if (text) options.onTextDelta?.(text);
+		const toolCalls: AgentFunctionCall[] = content.flatMap(block => {
+			if (block.type !== "tool_use" || typeof block.id !== "string" || typeof block.name !== "string") return [];
+			return [{ callId: block.id, name: block.name, arguments: JSON.stringify(block.input ?? {}) }];
 		});
+		const output: Record<string, unknown>[] = [
+			{
+				type: "message",
+				role: "assistant",
+				content: text ? [{ type: "output_text", text }] : [],
+				anthropic_content: content,
+			},
+		];
+		return { output, text, toolCalls, usage: anthropicUsage(options.model, payload.usage) };
+	} finally {
+		releaseProviderAttemptSignal(attempt.signal);
 	}
-	const payload: unknown = await response.json();
-	if (!isRecord(payload) || !Array.isArray(payload.content)) {
-		throw new Error("Anthropic Messages response did not contain content blocks");
-	}
-	const content = payload.content.filter(isRecord);
-	const text = content
-		.flatMap(block => (block.type === "text" && typeof block.text === "string" ? [block.text] : []))
-		.join("");
-	if (text) options.onTextDelta?.(text);
-	const toolCalls: AgentFunctionCall[] = content.flatMap(block => {
-		if (block.type !== "tool_use" || typeof block.id !== "string" || typeof block.name !== "string") return [];
-		return [{ callId: block.id, name: block.name, arguments: JSON.stringify(block.input ?? {}) }];
-	});
-	const output: Record<string, unknown>[] = [
-		{
-			type: "message",
-			role: "assistant",
-			content: text ? [{ type: "output_text", text }] : [],
-			anthropic_content: content,
-		},
-	];
-	return { output, text, toolCalls, usage: anthropicUsage(options.model, payload.usage) };
 }
 
 export function createAnthropicProvider(model: Model, resolver?: ProviderCredentialResolver): AgentTurnProvider {

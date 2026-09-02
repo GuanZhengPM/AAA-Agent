@@ -42,12 +42,14 @@ import {
 	type HarnessCandidate,
 	type HarnessRunMetrics,
 	type HarnessRunRecord,
+	indexCapabilityProfilesByModel,
 	inferTaskFeatures,
 	inferTaskSlice,
 	type LongRunCheckpoint,
 	type Model,
 	ModelCapabilityRegistry,
 	mergeVerifiedFacts,
+	parseModelVariantKey,
 	resetProviderConcurrencyGates,
 	routeTask,
 	runAgentSession,
@@ -1044,6 +1046,10 @@ describe("independent Codex identity", () => {
 		);
 		let primaryTurn = 0;
 		let verifierCalls = 0;
+		const acceptanceCommand =
+			process.platform === "win32"
+				? "python -m unittest tests/test_smoke.py -v && python -c \"print('COMPOUND_OK')\""
+				: "python3 -m unittest tests/test_smoke.py -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY";
 		const provider: AgentTurnProvider = {
 			provider: "test",
 			async runTurn(options) {
@@ -1054,14 +1060,13 @@ describe("independent Codex identity", () => {
 				primaryTurn += 1;
 				const call =
 					primaryTurn === 1
-						? { callId: "write-1", name: "write", arguments: '{"path":"result.txt","content":"fixed"}' }
+						? { callId: "write-1", name: "write", arguments: '{"path":"smoke.py","content":"fixed"}' }
 						: primaryTurn === 2
 							? {
 									callId: "check-1",
 									name: "shell",
 									arguments: JSON.stringify({
-										command:
-											"python3 -m unittest discover -s tests -v && python3 - <<'PY'\nprint('COMPOUND_OK')\nPY",
+										command: acceptanceCommand,
 									}),
 								}
 							: undefined;
@@ -1116,9 +1121,7 @@ describe("independent Codex identity", () => {
 		expect(result.success).toBe(true);
 		expect(verifierCalls).toBe(0);
 		expect(result.audit?.assurance).toBe("deterministic");
-		expect(result.audit?.evidence[0]?.summary).toContain(
-			"python3 -m unittest discover -s tests -v && python3 - <<'PY'",
-		);
+		expect(result.audit?.evidence[0]?.summary).toContain(acceptanceCommand.split("\n")[0]);
 		expect(result.audit?.evidence[0]?.summary).toContain("exitCode=0");
 	});
 
@@ -1210,7 +1213,15 @@ describe("independent Codex identity", () => {
 	it("does not short-circuit on an unrelated passing test", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-unrelated-check-"));
 		tempDirectories.push(directory);
+		// 一个与 billing 需求毫无关系、但必定通过的测试。此前的版本从未真正执行
+		// 任何检查命令，因此测的其实是"没有证据"而非"证据无关"。
+		await fs.writeFile(
+			path.join(directory, "unrelated.test.ts"),
+			'import { expect, test } from "bun:test";\ntest("unrelated sanity", () => { expect(1 + 1).toBe(2); });\n',
+			"utf8",
+		);
 		let verifierCalls = 0;
+		let primaryTurn = 0;
 		const model: Model = {
 			provider: "test",
 			id: "unrelated-check",
@@ -1240,20 +1251,36 @@ describe("independent Codex identity", () => {
 						usage: createEmptyUsageMetrics(),
 					};
 				}
-				if (options.tools.some(tool => tool.name === "write")) {
+				primaryTurn += 1;
+				if (primaryTurn === 1) {
+					const args = '{"path":"billing.ts","content":"changed"}';
 					return {
 						output: [
 							{
 								type: "function_call",
 								call_id: "write",
 								name: "write",
-								arguments: '{"path":"billing.ts","content":"changed"}',
+								arguments: args,
 							},
 						],
 						text: "",
-						toolCalls: [
-							{ callId: "write", name: "write", arguments: '{"path":"billing.ts","content":"changed"}' },
+						toolCalls: [{ callId: "write", name: "write", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (primaryTurn === 2) {
+					const args = JSON.stringify({ command: "bun test unrelated.test.ts" });
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "run-check",
+								name: "shell",
+								arguments: args,
+							},
 						],
+						text: "",
+						toolCalls: [{ callId: "run-check", name: "shell", arguments: args }],
 						usage: createEmptyUsageMetrics(),
 					};
 				}
@@ -1272,6 +1299,97 @@ describe("independent Codex identity", () => {
 		});
 		expect(verifierCalls).toBeGreaterThan(0);
 		expect(result.success).toBe(false);
+	});
+
+	it("short-circuits when a passing check is bound to the changed file", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "aaa-bound-check-"));
+		tempDirectories.push(directory);
+		// 与改动文件同名的测试：这次检查确实覆盖了改动，应当被接受。
+		await fs.writeFile(
+			path.join(directory, "billing.test.ts"),
+			'import { expect, test } from "bun:test";\ntest("billing", () => { expect(1 + 1).toBe(2); });\n',
+			"utf8",
+		);
+		let verifierCalls = 0;
+		let primaryTurn = 0;
+		const model: Model = {
+			provider: "test",
+			id: "bound-check",
+			name: "Bound Check",
+			api: "openai-chat-completions",
+			baseUrl: "http://127.0.0.1",
+			contextWindow: 8_000,
+			efforts: [Effort.Low],
+			authChannel: "local",
+		};
+		const provider: AgentTurnProvider = {
+			provider: "test",
+			async runTurn(options) {
+				if (options.systemPrompt.includes("independent read-only verifier")) {
+					verifierCalls += 1;
+					return {
+						output: [],
+						text: JSON.stringify({
+							passed: true,
+							summary: "Verifier reached, which should not happen for a bound check.",
+							completedGoalIds: [],
+							unmetCriteria: [],
+							evidence: [],
+							goalEvidence: [],
+						}),
+						toolCalls: [],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				primaryTurn += 1;
+				if (primaryTurn === 1) {
+					const args = '{"path":"billing.ts","content":"changed"}';
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "write",
+								name: "write",
+								arguments: args,
+							},
+						],
+						text: "",
+						toolCalls: [{ callId: "write", name: "write", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				if (primaryTurn === 2) {
+					const args = JSON.stringify({ command: "bun test billing.test.ts" });
+					return {
+						output: [
+							{
+								type: "function_call",
+								call_id: "run-check",
+								name: "shell",
+								arguments: args,
+							},
+						],
+						text: "",
+						toolCalls: [{ callId: "run-check", name: "shell", arguments: args }],
+						usage: createEmptyUsageMetrics(),
+					};
+				}
+				return { output: [], text: "done", toolCalls: [], usage: createEmptyUsageMetrics() };
+			},
+		};
+		const result = await runAdaptiveTask({
+			task: "Fix the billing calculation and run its tests",
+			model,
+			provider,
+			cwd: directory,
+			reasoningConfig: Effort.Low,
+			approveShell: () => true,
+			capabilities: new ModelCapabilityRegistry(),
+			overlays: new AdaptiveOverlayRegistry(),
+		});
+		expect(verifierCalls).toBe(0);
+		expect(result.success).toBe(true);
+		expect(result.audit?.assurance).toBe("deterministic");
 	});
 
 	it("shares one token ceiling across primary and verifier sessions", async () => {
@@ -1464,6 +1582,28 @@ describe("adaptive model routing", () => {
 		expect(variant.endpoint).toBe("https://chatgpt.com/backend-api");
 	});
 
+	it("restores model identity from a variant key and selects a stable display profile", () => {
+		const encoded = createModelVariant(
+			{
+				provider: "provider with spaces",
+				id: "model/name",
+				api: "openai-responses",
+				baseUrl: "https://example.com/v1",
+				efforts: [Effort.Low],
+			},
+			{ authChannel: "api_key", reasoningConfig: Effort.Low },
+		);
+		expect(parseModelVariantKey(encoded.key)).toEqual({ provider: "provider with spaces", modelId: "model/name" });
+		const coding = createDefaultCapabilityProfile(encoded, {}, "coding");
+		coding.samples = 9;
+		coding.coldStart = false;
+		const global = createDefaultCapabilityProfile(encoded, {}, "global");
+		global.samples = 2;
+		global.coldStart = false;
+		const indexed = indexCapabilityProfilesByModel([coding, global]);
+		expect(indexed.get("provider with spaces/model/name")).toBe(global);
+	});
+
 	it("updates exact capability profiles with weighted observations", () => {
 		const registry = new ModelCapabilityRegistry();
 		registry.registerFamilyPrior("openai", { toolSchemaReliability: 0.8 });
@@ -1537,13 +1677,51 @@ describe("adaptive model routing", () => {
 
 	it("classifies analysis questions as read-only and exposes permission as an orthogonal policy", () => {
 		const profile = createDefaultCapabilityProfile(variant);
-		const analysis = inferTaskFeatures("为什么删除用户失败？请分析原因，不要修改代码");
-		expect(analysis.readOnly).toBe(true);
-		expect(analysis.writesWorkspace).toBe(false);
-		expect(routeTask(analysis, profile).policy.permissions).toBe("read-only");
+		for (const task of [
+			"为什么删除用户失败？请分析原因，不要修改代码",
+			"分析删除失败",
+			"解释如何修复登录错误，不要改任何文件",
+			"Explain how to fix login without changing code",
+		]) {
+			const analysis = inferTaskFeatures(task);
+			expect(analysis.readOnly).toBe(true);
+			expect(analysis.writesWorkspace).toBe(false);
+			const route = routeTask(analysis, profile);
+			expect(route.policy.permissions).toBe("read-only");
+			expect(analysis.destructiveRisk).toBe(0.1);
+		}
 		const implementation = inferTaskFeatures("修复登录错误并运行测试");
 		expect(implementation.readOnly).toBe(false);
 		expect(routeTask(implementation, profile).policy.permissions).toBe("write");
+		for (const task of ["分析后修复登录错误", "Review the issue and fix it", "Delete production data"]) {
+			expect(inferTaskFeatures(task).readOnly).toBe(false);
+		}
+	});
+
+	it("defaults ambiguous mutation mentions to read-only unless the host supplies write evidence", () => {
+		const ambiguous = inferTaskFeatures("This function deletes users when authentication fails");
+		expect(ambiguous.readOnly).toBe(true);
+		expect(ambiguous.writesWorkspace).toBe(false);
+		const hintedWrite = inferTaskFeatures("Investigate the authentication failure", { writesWorkspace: true });
+		expect(hintedWrite.readOnly).toBe(false);
+		expect(hintedWrite.writesWorkspace).toBe(true);
+	});
+
+	it("exposes execution tools for explicit checks without treating analysis of test failures as execution", () => {
+		const profile = createDefaultCapabilityProfile(variant);
+		for (const task of ["Run the tests and report the result", "运行测试并报告结果"]) {
+			const features = inferTaskFeatures(task);
+			expect(features.readOnly).toBe(false);
+			expect(features.writesWorkspace).toBe(false);
+			expect(features.requiresVerification).toBe(true);
+			expect(routeTask(features, profile).policy.permissions).toBe("write");
+		}
+		for (const task of ["Analyze why the test failed", "分析测试失败原因", "检查代码并列出风险"]) {
+			const features = inferTaskFeatures(task);
+			expect(features.readOnly).toBe(true);
+			expect(features.requiresVerification).toBe(false);
+			expect(routeTask(features, profile).policy.permissions).toBe("read-only");
+		}
 	});
 
 	it("lets explicit route overrides win over inferred policy", () => {
@@ -1703,7 +1881,7 @@ describe("completion gates", () => {
 			model: variant,
 			featureHints: { estimatedFiles: 2, writesWorkspace: true },
 		});
-		expect(roundArtifacts).toEqual([[], []]);
+		expect(roundArtifacts).toEqual([[], [], []]);
 		expect(result.checkpoint.artifacts).toEqual([]);
 		expect(result.checkpoint.facts).toEqual([]);
 	});
@@ -2014,6 +2192,16 @@ describe("standalone workspace tools", () => {
 		await expect(toolNamed(tools.allTools, "search").execute("search", { pattern: "x".repeat(513) })).rejects.toThrow(
 			"exceeds 512",
 		);
+		for (const pattern of ["(a+)+$", "(a|aa)+$", ".*prefix.*suffix", "(x{1,3})+"]) {
+			await expect(toolNamed(tools.allTools, "search").execute("search", { pattern })).rejects.toThrow(
+				"Unsafe search pattern",
+			);
+		}
+		await expect(
+			toolNamed(tools.allTools, "search").execute("search", { pattern: String.raw`(a)\1` }),
+		).rejects.toThrow("backreferences");
+		const safe = await toolNamed(tools.allTools, "search").execute("search", { pattern: "need(?:le|les)" });
+		expect(safe.isError).not.toBe(true);
 	});
 
 	it("rejects a stale snapshot after an external write", async () => {

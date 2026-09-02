@@ -7,6 +7,7 @@ import {
 	getAdaptiveHarnessDir,
 	type LongRunCheckpoint,
 	type Model,
+	type PermissionMode,
 	SERVICE_TIERS,
 	type ServiceTier,
 	type StructuredContextState,
@@ -16,7 +17,7 @@ import {
 } from "@aaa-agent/runtime";
 import { z } from "zod/v4";
 
-export const CURRENT_SESSION_VERSION = 6;
+export const CURRENT_SESSION_VERSION = 7;
 const MAX_SESSION_MESSAGES = 40;
 const MAX_SESSION_CHARACTERS = 120_000;
 const MAX_SESSION_FILES = 100;
@@ -91,6 +92,7 @@ const sessionSchema = z.object({
 	thinkingMode: z.enum(THINKING_MODES).optional(),
 	effort: z.enum(THINKING_EFFORTS).optional(),
 	serviceTier: z.enum(SERVICE_TIERS).optional(),
+	permissionMode: z.enum(["read-only", "write"]).optional(),
 	messages: z.array(messageSchema),
 	/** v6 append-only transcript sidecar; metadata JSON keeps messages empty. */
 	transcriptFile: z.string().min(1).optional(),
@@ -133,6 +135,7 @@ export interface InteractiveSession {
 	modelId: string;
 	thinkingMode: ThinkingMode;
 	serviceTier?: ServiceTier;
+	permissionMode?: PermissionMode;
 	messages: AgentConversationMessage[];
 	/** Relative append-only sidecar name and committed message count. */
 	transcriptFile?: string;

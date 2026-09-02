@@ -6,7 +6,6 @@ describe("extractLedgerEntries", () => {
 		const msg =
 			"第 3 轮，两处修正，别的都不动：1) 上一轮我说的 COUPON25 抵扣上限不对，应该是 **2500 分**，不是 3000，请改过来。2) 退款准入阈值 `REFUND_THRESHOLD_CENTS` 从 10000 下调到 **7500**。";
 		const es = extractLedgerEntries(msg, 3);
-		console.log(JSON.stringify(es, null, 1));
 		const corr = es.filter(e => e.kind === "correction");
 		expect(corr.length).toBeGreaterThanOrEqual(1);
 		const refund = corr.find(e => e.subject.includes("REFUND_THRESHOLD_CENTS"));
@@ -19,7 +18,6 @@ describe("extractLedgerEntries", () => {
 			"我特别强调一点希望全程保持的约定：**税率常量 TAX_RATE_BPS 保持 1300 不变**，后面无论怎么折腾优惠券、运费都不要动税率。";
 		const es = extractLedgerEntries(msg, 2);
 		const inv = es.find(e => e.kind === "invariant");
-		console.log(JSON.stringify(es));
 		expect(inv?.subject).toBe("TAX_RATE_BPS");
 		expect(inv?.newValue).toBe("1300");
 	});

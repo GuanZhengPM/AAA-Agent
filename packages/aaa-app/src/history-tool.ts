@@ -13,6 +13,7 @@ export function createHistorySearchTool(cwd: string): AgentTool {
 		name: "history_search",
 		label: "Search history",
 		description: historySearchDescription,
+		sideEffect: "none",
 		parameters: historySearchSchema,
 		async execute(_toolCallId, rawParams) {
 			const params = historySearchSchema.parse(rawParams);
